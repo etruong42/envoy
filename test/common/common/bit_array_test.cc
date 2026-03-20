@@ -81,7 +81,7 @@ TEST_P(BitArrayTest, CanSetAndGetAllBits) { populateBitArrayAndCheckValuesStored
 
 TEST_P(BitArrayTest, SetOutOfBounds) {
   BitArray bit_array(bit_width_, num_items_);
-  EXPECT_DEATH(bit_array.set(num_items_, 0), "");
+  EXPECT_ENVOY_BUG(bit_array.set(num_items_, 0), "BitArray::set requested index out of bounds");
 }
 
 TEST_P(BitArrayTest, GetOutOfBounds) {

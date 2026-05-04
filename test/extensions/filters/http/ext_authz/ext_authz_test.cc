@@ -1,7 +1,11 @@
 #include <chrono>
 #include <memory>
+#include <set>
 #include <string>
 #include <vector>
+
+#include "google/protobuf/descriptor.h"
+#include "google/protobuf/reflection.h"
 
 #include "envoy/config/core/v3/base.pb.h"
 #include "envoy/extensions/filters/http/ext_authz/v3/ext_authz.pb.h"
@@ -51,6 +55,57 @@ namespace HttpFilters {
 namespace ExtAuthz {
 namespace {
 
+/**
+ * Helper class to track which protobuf fields are exercised in the test suite.
+ * It uses reflection to iterate over populated fields of ExtAuthz config and its nested messages.
+ */
+class ExtAuthzProtoCoverageHelper {
+public:
+  static void recordFields(const google::protobuf::Message& message) {
+    const google::protobuf::Reflection* reflection = message.GetReflection();
+    std::vector<const google::protobuf::FieldDescriptor*> set_fields;
+    reflection->ListFields(message, &set_fields);
+    for (const auto* field : set_fields) {
+      if (isExtAuthzProtoField(field)) {
+        covered_fields_().insert(field);
+      }
+      if (field->type() == google::protobuf::FieldDescriptor::TYPE_MESSAGE) {
+        if (field->is_repeated()) {
+          int size = reflection->FieldSize(message, field);
+          for (int i = 0; i < size; ++i) {
+            recordFields(reflection->GetRepeatedMessage(message, field, i));
+          }
+        } else {
+          recordFields(reflection->GetMessage(message, field));
+        }
+      }
+    }
+  }
+  static void collectAllFields(const google::protobuf::Descriptor* descriptor,
+                               std::set<const google::protobuf::FieldDescriptor*>& all_fields,
+                               std::set<const google::protobuf::Descriptor*>& visited) {
+    if (!visited.insert(descriptor).second) {
+      return;
+    }
+    for (int i = 0; i < descriptor->field_count(); ++i) {
+      const auto* field = descriptor->field(i);
+      all_fields.insert(field);
+      if (field->type() == google::protobuf::FieldDescriptor::TYPE_MESSAGE) {
+        if (field->message_type()->file()->name() == descriptor->file()->name()) {
+          collectAllFields(field->message_type(), all_fields, visited);
+        }
+      }
+    }
+  }
+  static std::set<const google::protobuf::FieldDescriptor*>& covered_fields_() {
+    static auto* covered = new std::set<const google::protobuf::FieldDescriptor*>();
+    return *covered;
+  }
+private:
+  static bool isExtAuthzProtoField(const google::protobuf::FieldDescriptor* field) {
+    return field->file()->name().find("ext_authz.proto") != std::string::npos;
+  }
+};
 // Matcher to convert a Buffer::Instance to its string representation for composition.
 MATCHER_P(BufferString, m, "") {
   return testing::ExplainMatchResult(m, arg->toString(), result_listener);
@@ -114,11 +169,13 @@ public:
     envoy::extensions::filters::http::ext_authz::v3::ExtAuthz proto_config{};
     if (!yaml.empty()) {
       TestUtility::loadFromYaml(yaml, proto_config);
+      ExtAuthzProtoCoverageHelper::recordFields(proto_config);
     }
     initialize(proto_config);
   }
 
   void initialize(const envoy::extensions::filters::http::ext_authz::v3::ExtAuthz& proto_config) {
+    ExtAuthzProtoCoverageHelper::recordFields(proto_config);
     config_ = std::make_shared<FilterConfig>(proto_config, *stats_store_.rootScope(),
                                              "ext_authz_prefix", factory_context_);
     client_ = new NiceMock<Filters::Common::ExtAuthz::MockClient>();
@@ -150,7 +207,7 @@ public:
     )EOF";
 
     envoy::extensions::filters::http::ext_authz::v3::ExtAuthz proto_config{};
-    TestUtility::loadFromYaml(http_client ? http_config : grpc_config, proto_config);
+    TestUtility::loadFromYaml(http_client ? http_config : grpc_config, proto_config); ExtAuthzProtoCoverageHelper::recordFields(proto_config);
     proto_config.set_failure_mode_allow(failure_mode_allow);
     if (emit_filter_state_stats) {
       proto_config.set_emit_filter_state_stats(true);
@@ -1143,21 +1200,23 @@ TEST_F(HttpFilterTest, MergeConfig) {
   // First config base config with one base value, and one value to be overridden.
   (*extensions)["base_key"] = "base_value";
   (*extensions)["merged_key"] = "base_value";
-  FilterConfigPerRoute base_config(settings);
+  ExtAuthzProtoCoverageHelper::recordFields(settings);
+  ExtAuthzProtoCoverageHelper::recordFields(settings); FilterConfigPerRoute base_config(settings);
 
   // Construct a config to merge, that provides one value and overrides one value.
   settings.Clear();
   auto&& specific_extensions = settings.mutable_check_settings()->mutable_context_extensions();
   (*specific_extensions)["merged_key"] = "value";
   (*specific_extensions)["key"] = "value";
-  FilterConfigPerRoute specific_config(settings);
+  ExtAuthzProtoCoverageHelper::recordFields(settings);
+  ExtAuthzProtoCoverageHelper::recordFields(settings); FilterConfigPerRoute specific_config(settings);
 
   // Perform the merge:
   base_config.merge(specific_config);
 
   settings.Clear();
   settings.set_disabled(true);
-  FilterConfigPerRoute disabled_config(settings);
+  ExtAuthzProtoCoverageHelper::recordFields(settings); FilterConfigPerRoute disabled_config(settings);
 
   // Perform a merge with disabled config:
   base_config.merge(disabled_config);
@@ -1971,7 +2030,7 @@ TEST_F(HttpFilterTest, BadConfig) {
   failure_mode_allow: true
   )EOF";
   envoy::extensions::filters::http::ext_authz::v3::ExtAuthz proto_config{};
-  TestUtility::loadFromYaml(filter_config, proto_config);
+  TestUtility::loadFromYaml(filter_config, proto_config); ExtAuthzProtoCoverageHelper::recordFields(proto_config);
   EXPECT_THROW(TestUtility::downcastAndValidate<
                    const envoy::extensions::filters::http::ext_authz::v3::ExtAuthz&>(proto_config),
                ProtoValidationException);
@@ -3075,7 +3134,7 @@ TEST_F(HttpFilterTest, MetadataContext) {
   )EOF";
 
   envoy::config::core::v3::Metadata metadata;
-  TestUtility::loadFromYaml(yaml, metadata);
+  TestUtility::loadFromYaml(yaml, metadata); ExtAuthzProtoCoverageHelper::recordFields(metadata);
   ON_CALL(decoder_filter_callbacks_.stream_info_, dynamicMetadata())
       .WillByDefault(ReturnRef(metadata));
 
@@ -3187,8 +3246,8 @@ TEST_F(HttpFilterTest, ConnectionMetadataContext) {
   prepareCheck();
 
   envoy::config::core::v3::Metadata request_metadata, connection_metadata;
-  TestUtility::loadFromYaml(request_yaml, request_metadata);
-  TestUtility::loadFromYaml(connection_yaml, connection_metadata);
+  TestUtility::loadFromYaml(request_yaml, request_metadata); ExtAuthzProtoCoverageHelper::recordFields(request_metadata);
+  TestUtility::loadFromYaml(connection_yaml, connection_metadata); ExtAuthzProtoCoverageHelper::recordFields(connection_metadata);
   ON_CALL(decoder_filter_callbacks_.stream_info_, dynamicMetadata())
       .WillByDefault(ReturnRef(request_metadata));
   connection_.stream_info_.metadata_ = connection_metadata;
@@ -3338,9 +3397,9 @@ TEST_F(HttpFilterTest, RouteMetadataContext) {
   prepareCheck();
 
   envoy::config::core::v3::Metadata request_metadata, connection_metadata, route_metadata;
-  TestUtility::loadFromYaml(request_yaml, request_metadata);
-  TestUtility::loadFromYaml(connection_yaml, connection_metadata);
-  TestUtility::loadFromYaml(route_yaml, route_metadata);
+  TestUtility::loadFromYaml(request_yaml, request_metadata); ExtAuthzProtoCoverageHelper::recordFields(request_metadata);
+  TestUtility::loadFromYaml(connection_yaml, connection_metadata); ExtAuthzProtoCoverageHelper::recordFields(connection_metadata);
+  TestUtility::loadFromYaml(route_yaml, route_metadata); ExtAuthzProtoCoverageHelper::recordFields(route_metadata);
   ON_CALL(decoder_filter_callbacks_.stream_info_, dynamicMetadata())
       .WillByDefault(ReturnRef(request_metadata));
   connection_.stream_info_.metadata_ = connection_metadata;
@@ -3511,7 +3570,7 @@ TEST_F(HttpFilterTest, MetadataDisabled) {
       k1: skip
   )EOF";
   envoy::config::core::v3::Metadata metadata;
-  TestUtility::loadFromYaml(yaml, metadata);
+  TestUtility::loadFromYaml(yaml, metadata); ExtAuthzProtoCoverageHelper::recordFields(metadata);
   ON_CALL(decoder_filter_callbacks_.stream_info_, dynamicMetadata())
       .WillByDefault(ReturnRef(metadata));
 
@@ -3543,7 +3602,7 @@ TEST_F(HttpFilterTest, MetadataEnabled) {
       k1: check
   )EOF";
   envoy::config::core::v3::Metadata metadata;
-  TestUtility::loadFromYaml(yaml, metadata);
+  TestUtility::loadFromYaml(yaml, metadata); ExtAuthzProtoCoverageHelper::recordFields(metadata);
   ON_CALL(decoder_filter_callbacks_.stream_info_, dynamicMetadata())
       .WillByDefault(ReturnRef(metadata));
 
@@ -3590,7 +3649,7 @@ TEST_F(HttpFilterTest, FilterEnabledButMetadataDisabled) {
       k1: skip
   )EOF";
   envoy::config::core::v3::Metadata metadata;
-  TestUtility::loadFromYaml(yaml, metadata);
+  TestUtility::loadFromYaml(yaml, metadata); ExtAuthzProtoCoverageHelper::recordFields(metadata);
   ON_CALL(decoder_filter_callbacks_.stream_info_, dynamicMetadata())
       .WillByDefault(ReturnRef(metadata));
 
@@ -3634,7 +3693,7 @@ TEST_F(HttpFilterTest, FilterDisabledButMetadataEnabled) {
       k1: check
   )EOF";
   envoy::config::core::v3::Metadata metadata;
-  TestUtility::loadFromYaml(yaml, metadata);
+  TestUtility::loadFromYaml(yaml, metadata); ExtAuthzProtoCoverageHelper::recordFields(metadata);
   ON_CALL(decoder_filter_callbacks_.stream_info_, dynamicMetadata())
       .WillByDefault(ReturnRef(metadata));
 
@@ -3678,7 +3737,7 @@ TEST_F(HttpFilterTest, FilterEnabledAndMetadataEnabled) {
       k1: check
   )EOF";
   envoy::config::core::v3::Metadata metadata;
-  TestUtility::loadFromYaml(yaml, metadata);
+  TestUtility::loadFromYaml(yaml, metadata); ExtAuthzProtoCoverageHelper::recordFields(metadata);
   ON_CALL(decoder_filter_callbacks_.stream_info_, dynamicMetadata())
       .WillByDefault(ReturnRef(metadata));
 
@@ -3770,14 +3829,14 @@ TEST_P(HttpFilterTestParam, ContextExtensions) {
   (*settingsvhost.mutable_check_settings()->mutable_context_extensions())["key_route"] =
       "default_route_value";
   // Initialize the virtual host's per filter config.
-  FilterConfigPerRoute auth_per_vhost(settingsvhost);
+  ExtAuthzProtoCoverageHelper::recordFields(settingsvhost); FilterConfigPerRoute auth_per_vhost(settingsvhost);
 
   // Place something in the context extensions on the route.
   envoy::extensions::filters::http::ext_authz::v3::ExtAuthzPerRoute settingsroute;
   (*settingsroute.mutable_check_settings()->mutable_context_extensions())["key_route"] =
       "value_route";
   // Initialize the route's per filter config.
-  FilterConfigPerRoute auth_per_route(settingsroute);
+  ExtAuthzProtoCoverageHelper::recordFields(settingsroute); FilterConfigPerRoute auth_per_route(settingsroute);
 
   EXPECT_CALL(*decoder_filter_callbacks_.route_, mostSpecificPerFilterConfig(_))
       .WillOnce(Return(&auth_per_route));
@@ -3810,7 +3869,7 @@ TEST_P(HttpFilterTestParam, ContextExtensions) {
 TEST_P(HttpFilterTestParam, DisabledOnRoute) {
   envoy::extensions::filters::http::ext_authz::v3::ExtAuthzPerRoute settings;
   std::unique_ptr<FilterConfigPerRoute> auth_per_route =
-      std::make_unique<FilterConfigPerRoute>(settings);
+       (ExtAuthzProtoCoverageHelper::recordFields(settings), std::make_unique<FilterConfigPerRoute>(settings));
 
   prepareCheck();
 
@@ -3819,7 +3878,7 @@ TEST_P(HttpFilterTestParam, DisabledOnRoute) {
     // Set disabled
     settings.set_disabled(disabled);
     // Initialize the route's per filter config.
-    auth_per_route = std::make_unique<FilterConfigPerRoute>(settings);
+    auth_per_route =  (ExtAuthzProtoCoverageHelper::recordFields(settings), std::make_unique<FilterConfigPerRoute>(settings));
     // Update the mock to return the new pointer
     ON_CALL(*decoder_filter_callbacks_.route_, mostSpecificPerFilterConfig(_))
         .WillByDefault(Return(auth_per_route.get()));
@@ -3844,7 +3903,7 @@ TEST_P(HttpFilterTestParam, DisabledOnRoute) {
 TEST_P(HttpFilterTestParam, DisabledOnRouteWithRequestBody) {
   envoy::extensions::filters::http::ext_authz::v3::ExtAuthzPerRoute settings;
   std::unique_ptr<FilterConfigPerRoute> auth_per_route =
-      std::make_unique<FilterConfigPerRoute>(settings);
+       (ExtAuthzProtoCoverageHelper::recordFields(settings), std::make_unique<FilterConfigPerRoute>(settings));
 
   auto test_disable = [&](bool disabled) {
     initialize(R"EOF(
@@ -3860,7 +3919,7 @@ TEST_P(HttpFilterTestParam, DisabledOnRouteWithRequestBody) {
     // Set the filter disabled setting.
     settings.set_disabled(disabled);
     // Initialize the route's per filter config.
-    auth_per_route = std::make_unique<FilterConfigPerRoute>(settings);
+    auth_per_route =  (ExtAuthzProtoCoverageHelper::recordFields(settings), std::make_unique<FilterConfigPerRoute>(settings));
     // Update the mock to return the new pointer.
     ON_CALL(*decoder_filter_callbacks_.route_, mostSpecificPerFilterConfig(_))
         .WillByDefault(Return(auth_per_route.get()));
@@ -4806,7 +4865,7 @@ TEST_P(HttpFilterTestParam, OnDestroyCancelsCorrectClient) {
       ->set_cluster_name("per_route_ext_authz_cluster");
 
   std::unique_ptr<FilterConfigPerRoute> per_route_filter_config =
-      std::make_unique<FilterConfigPerRoute>(per_route_config);
+       (ExtAuthzProtoCoverageHelper::recordFields(per_route_config), std::make_unique<FilterConfigPerRoute>(per_route_config));
 
   // Set up route to return per-route config.
   ON_CALL(*decoder_filter_callbacks_.route_, mostSpecificPerFilterConfig(_))
@@ -4889,7 +4948,7 @@ TEST_P(HttpFilterTestParam, NoCluster) {
   (*settingsroute.mutable_check_settings()->mutable_context_extensions())["key_route"] =
       "value_route";
   // Initialize the route's per filter config.
-  FilterConfigPerRoute auth_per_route(settingsroute);
+  ExtAuthzProtoCoverageHelper::recordFields(settingsroute); FilterConfigPerRoute auth_per_route(settingsroute);
   ON_CALL(*decoder_filter_callbacks_.route_, mostSpecificPerFilterConfig(_))
       .WillByDefault(Return(&auth_per_route));
 
@@ -4952,7 +5011,7 @@ TEST_F(HttpFilterTest, PerRouteCheckSettingsWorks) {
   // Initialize the route's per filter config.
   envoy::extensions::filters::http::ext_authz::v3::ExtAuthzPerRoute settings;
   settings.mutable_check_settings()->CopyFrom(check_settings);
-  FilterConfigPerRoute auth_per_route(settings);
+  ExtAuthzProtoCoverageHelper::recordFields(settings); FilterConfigPerRoute auth_per_route(settings);
 
   ON_CALL(*decoder_filter_callbacks_.route_, mostSpecificPerFilterConfig(_))
       .WillByDefault(Return(&auth_per_route));
@@ -5036,7 +5095,7 @@ TEST_F(HttpFilterTest, PerRouteCheckSettingsOverrideWorks) {
   // Initialize the route's per filter config.
   envoy::extensions::filters::http::ext_authz::v3::ExtAuthzPerRoute settings;
   settings.mutable_check_settings()->CopyFrom(check_settings);
-  FilterConfigPerRoute auth_per_route(settings);
+  ExtAuthzProtoCoverageHelper::recordFields(settings); FilterConfigPerRoute auth_per_route(settings);
 
   ON_CALL(*decoder_filter_callbacks_.route_, mostSpecificPerFilterConfig(_))
       .WillByDefault(Return(&auth_per_route));
@@ -5075,7 +5134,7 @@ TEST_F(HttpFilterTest, PerRouteCheckSettingsOverrideWorks) {
 TEST_P(HttpFilterTestParam, DisableRequestBodyBufferingOnRoute) {
   envoy::extensions::filters::http::ext_authz::v3::ExtAuthzPerRoute settings;
   std::unique_ptr<FilterConfigPerRoute> auth_per_route =
-      std::make_unique<FilterConfigPerRoute>(settings);
+       (ExtAuthzProtoCoverageHelper::recordFields(settings), std::make_unique<FilterConfigPerRoute>(settings));
 
   auto test_disable_request_body_buffering = [&](bool bypass) {
     initialize(R"EOF(
@@ -5091,7 +5150,7 @@ TEST_P(HttpFilterTestParam, DisableRequestBodyBufferingOnRoute) {
     // Set bypass request body buffering for this route.
     settings.mutable_check_settings()->set_disable_request_body_buffering(bypass);
     // Initialize the route's per filter config.
-    auth_per_route = std::make_unique<FilterConfigPerRoute>(settings);
+    auth_per_route =  (ExtAuthzProtoCoverageHelper::recordFields(settings), std::make_unique<FilterConfigPerRoute>(settings));
     // Update the mock to return the new pointer.
     ON_CALL(*decoder_filter_callbacks_.route_, mostSpecificPerFilterConfig(_))
         .WillByDefault(Return(auth_per_route.get()));
@@ -5236,7 +5295,7 @@ TEST_P(EmitFilterStateTest, PreexistingFilterStateDifferentTypeMutable) {
   test(response);
 }
 
-// hasData<ExtAuthzLoggingInfo>() will return true so the filter will not try to override the data.
+// hasData<ExtAuthzLoggingInfo>() will true so the filter will not try to override the data.
 TEST_P(EmitFilterStateTest, PreexistingFilterStateSameTypeMutable) {
   class TestObject : public Envoy::StreamInfo::FilterState::Object {};
   decoder_filter_callbacks_.stream_info_.filter_state_->setData(
@@ -5273,7 +5332,7 @@ TEST_P(HttpFilterTestParam, PerRouteGrpcServiceOverrideWithNullServerContext) {
       ->set_cluster_name("per_route_ext_authz_cluster");
 
   std::unique_ptr<FilterConfigPerRoute> per_route_filter_config =
-      std::make_unique<FilterConfigPerRoute>(per_route_config);
+       (ExtAuthzProtoCoverageHelper::recordFields(per_route_config), std::make_unique<FilterConfigPerRoute>(per_route_config));
 
   // Set up route to return per-route config
   ON_CALL(*decoder_filter_callbacks_.route_, mostSpecificPerFilterConfig(_))
@@ -5317,9 +5376,9 @@ TEST_P(HttpFilterTestParam, PerRouteConfigurationMergingWithContextExtensions) {
       {"shared_key", "specific_shared_value"});
 
   // Test merging using the merge constructor
-  FilterConfigPerRoute base_filter_config(base_config);
-  FilterConfigPerRoute specific_filter_config(specific_config);
-  FilterConfigPerRoute merged_config(base_filter_config, specific_filter_config);
+  ExtAuthzProtoCoverageHelper::recordFields(base_config); FilterConfigPerRoute base_filter_config(base_config);
+   /* recorded elsewhere */; FilterConfigPerRoute specific_filter_config(specific_config);
+   /* FilterConfigPerRoute recorded elsewhere */;  /* FilterConfigPerRoute recorded elsewhere */; FilterConfigPerRoute merged_config(base_filter_config, specific_filter_config);
 
   // Verify merged context extensions
   const auto& merged_extensions = merged_config.contextExtensions();
@@ -5351,9 +5410,9 @@ TEST_P(HttpFilterTestParam, PerRouteConfigurationMergingWithGrpcServiceOverride)
       {"specific_key", "specific_value"});
 
   // Test merging using the merge constructor
-  FilterConfigPerRoute base_filter_config(base_config);
-  FilterConfigPerRoute specific_filter_config(specific_config);
-  FilterConfigPerRoute merged_config(base_filter_config, specific_filter_config);
+  ExtAuthzProtoCoverageHelper::recordFields(base_config); FilterConfigPerRoute base_filter_config(base_config);
+   /* recorded elsewhere */; FilterConfigPerRoute specific_filter_config(specific_config);
+   /* FilterConfigPerRoute recorded elsewhere */;  /* FilterConfigPerRoute recorded elsewhere */; FilterConfigPerRoute merged_config(base_filter_config, specific_filter_config);
 
   // Verify gRPC service override is from more specific config
   EXPECT_TRUE(merged_config.grpcService().has_value());
@@ -5387,9 +5446,9 @@ TEST_P(HttpFilterTestParam, PerRouteConfigurationMergingWithRequestBodySettings)
       false);
 
   // Test merging using the merge constructor
-  FilterConfigPerRoute base_filter_config(base_config);
-  FilterConfigPerRoute specific_filter_config(specific_config);
-  FilterConfigPerRoute merged_config(base_filter_config, specific_filter_config);
+  ExtAuthzProtoCoverageHelper::recordFields(base_config); FilterConfigPerRoute base_filter_config(base_config);
+   /* recorded elsewhere */; FilterConfigPerRoute specific_filter_config(specific_config);
+   /* FilterConfigPerRoute recorded elsewhere */;  /* FilterConfigPerRoute recorded elsewhere */; FilterConfigPerRoute merged_config(base_filter_config, specific_filter_config);
 
   // Verify request body settings are from more specific config
   const auto& merged_check_settings = merged_config.checkSettings();
@@ -5415,9 +5474,9 @@ TEST_P(HttpFilterTestParam, PerRouteConfigurationMergingWithDisableRequestBodyBu
   specific_config.mutable_check_settings()->set_disable_request_body_buffering(true);
 
   // Test merging using the merge constructor
-  FilterConfigPerRoute base_filter_config(base_config);
-  FilterConfigPerRoute specific_filter_config(specific_config);
-  FilterConfigPerRoute merged_config(base_filter_config, specific_filter_config);
+  ExtAuthzProtoCoverageHelper::recordFields(base_config); FilterConfigPerRoute base_filter_config(base_config);
+   /* recorded elsewhere */; FilterConfigPerRoute specific_filter_config(specific_config);
+   /* FilterConfigPerRoute recorded elsewhere */;  /* FilterConfigPerRoute recorded elsewhere */; FilterConfigPerRoute merged_config(base_filter_config, specific_filter_config);
 
   // Verify disable_request_body_buffering is from more specific config
   const auto& merged_check_settings = merged_config.checkSettings();
@@ -5455,15 +5514,15 @@ TEST_P(HttpFilterTestParam, PerRouteConfigurationMergingMultipleLevels) {
       {"shared_key", "wc_shared_value"});
 
   // Test merging from least specific to most specific
-  FilterConfigPerRoute vh_filter_config(vh_config);
-  FilterConfigPerRoute route_filter_config(route_config);
-  FilterConfigPerRoute wc_filter_config(wc_config);
+  ExtAuthzProtoCoverageHelper::recordFields(vh_config); FilterConfigPerRoute vh_filter_config(vh_config);
+  ExtAuthzProtoCoverageHelper::recordFields(route_config); FilterConfigPerRoute route_filter_config(route_config);
+  ExtAuthzProtoCoverageHelper::recordFields(wc_config); FilterConfigPerRoute wc_filter_config(wc_config);
 
   // First merge: vh + route
-  FilterConfigPerRoute vh_route_merged(vh_filter_config, route_filter_config);
+   /* FilterConfigPerRoute recorded elsewhere */;  /* FilterConfigPerRoute recorded elsewhere */; FilterConfigPerRoute vh_route_merged(vh_filter_config, route_filter_config);
 
   // Second merge: (vh + route) + weighted cluster
-  FilterConfigPerRoute final_merged(vh_route_merged, wc_filter_config);
+   /* FilterConfigPerRoute recorded elsewhere */;  /* FilterConfigPerRoute recorded elsewhere */; FilterConfigPerRoute final_merged(vh_route_merged, wc_filter_config);
 
   // Verify final merged context extensions
   const auto& merged_extensions = final_merged.contextExtensions();
@@ -5498,9 +5557,9 @@ TEST_P(HttpFilterTestParam, PerRouteContextExtensionsPrecedence) {
       {"shared_key", "specific_check_shared_value"});
 
   // Test merging using the merge constructor.
-  FilterConfigPerRoute base_filter_config(base_config);
-  FilterConfigPerRoute specific_filter_config(specific_config);
-  FilterConfigPerRoute merged_config(base_filter_config, specific_filter_config);
+  ExtAuthzProtoCoverageHelper::recordFields(base_config); FilterConfigPerRoute base_filter_config(base_config);
+   /* recorded elsewhere */; FilterConfigPerRoute specific_filter_config(specific_config);
+   /* FilterConfigPerRoute recorded elsewhere */;  /* FilterConfigPerRoute recorded elsewhere */; FilterConfigPerRoute merged_config(base_filter_config, specific_filter_config);
 
   // Verify context extensions are properly merged.
   const auto& merged_extensions = merged_config.contextExtensions();
@@ -5525,7 +5584,7 @@ TEST_P(HttpFilterTestParam, PerRouteGoogleGrpcServiceConfiguration) {
       ->set_target_uri("https://ext-authz.googleapis.com");
 
   std::unique_ptr<FilterConfigPerRoute> per_route_filter_config =
-      std::make_unique<FilterConfigPerRoute>(per_route_config);
+       (ExtAuthzProtoCoverageHelper::recordFields(per_route_config), std::make_unique<FilterConfigPerRoute>(per_route_config));
 
   // Verify Google gRPC service is properly configured
   EXPECT_TRUE(per_route_filter_config->grpcService().has_value());
@@ -5567,9 +5626,9 @@ TEST_P(HttpFilterTestParam, PerRouteConfigurationMergingWithEmptyConfigurations)
   envoy::extensions::filters::http::ext_authz::v3::ExtAuthzPerRoute specific_config;
 
   // Test merging using the merge constructor.
-  FilterConfigPerRoute base_filter_config(base_config);
-  FilterConfigPerRoute specific_filter_config(specific_config);
-  FilterConfigPerRoute merged_config(base_filter_config, specific_filter_config);
+  ExtAuthzProtoCoverageHelper::recordFields(base_config); FilterConfigPerRoute base_filter_config(base_config);
+   /* recorded elsewhere */; FilterConfigPerRoute specific_filter_config(specific_config);
+   /* FilterConfigPerRoute recorded elsewhere */;  /* FilterConfigPerRoute recorded elsewhere */; FilterConfigPerRoute merged_config(base_filter_config, specific_filter_config);
 
   // Verify merged configuration has empty context extensions.
   const auto& merged_extensions = merged_config.contextExtensions();
@@ -5589,7 +5648,7 @@ TEST_P(HttpFilterTestParam, PerRouteGrpcServiceMergingWithBaseConfiguration) {
   // Create base per-route configuration.
   envoy::extensions::filters::http::ext_authz::v3::ExtAuthzPerRoute base_config;
   (*base_config.mutable_check_settings()->mutable_context_extensions())["base"] = "value";
-  FilterConfigPerRoute base_filter_config(base_config);
+  ExtAuthzProtoCoverageHelper::recordFields(base_config); FilterConfigPerRoute base_filter_config(base_config);
 
   // Create per-route configuration with gRPC service.
   envoy::extensions::filters::http::ext_authz::v3::ExtAuthzPerRoute per_route_config;
@@ -5600,7 +5659,7 @@ TEST_P(HttpFilterTestParam, PerRouteGrpcServiceMergingWithBaseConfiguration) {
   (*per_route_config.mutable_check_settings()->mutable_context_extensions())["route"] = "override";
 
   // Test merging constructor.
-  FilterConfigPerRoute merged_config(base_filter_config, per_route_config);
+   /* FilterConfigPerRoute recorded elsewhere */; ExtAuthzProtoCoverageHelper::recordFields(per_route_config); FilterConfigPerRoute merged_config(base_filter_config, per_route_config);
 
   // Verify the merged configuration has the gRPC service from the per-route config.
   EXPECT_TRUE(merged_config.grpcService().has_value());
@@ -5635,7 +5694,7 @@ TEST_P(HttpFilterTestParam, PerRouteConfigurationIntegrationTest) {
       "test_value";
 
   std::unique_ptr<FilterConfigPerRoute> per_route_filter_config =
-      std::make_unique<FilterConfigPerRoute>(per_route_config);
+       (ExtAuthzProtoCoverageHelper::recordFields(per_route_config), std::make_unique<FilterConfigPerRoute>(per_route_config));
 
   // Mock decoder callbacks to return per-route config.
   ON_CALL(decoder_filter_callbacks_, mostSpecificPerFilterConfig())
@@ -5719,7 +5778,7 @@ TEST_P(HttpFilterTestParam, PerRouteGrpcClientCreationAndUsage) {
       "test_value";
 
   std::unique_ptr<FilterConfigPerRoute> per_route_filter_config =
-      std::make_unique<FilterConfigPerRoute>(per_route_config);
+       (ExtAuthzProtoCoverageHelper::recordFields(per_route_config), std::make_unique<FilterConfigPerRoute>(per_route_config));
 
   // Set up route to return per-route config.
   ON_CALL(*decoder_filter_callbacks_.route_, mostSpecificPerFilterConfig(_))
@@ -5795,7 +5854,7 @@ TEST_P(HttpFilterTestParam, PerRouteHttpServiceConfigurationParsing) {
       "/api/v2/auth");
 
   std::unique_ptr<FilterConfigPerRoute> per_route_filter_config =
-      std::make_unique<FilterConfigPerRoute>(per_route_config);
+       (ExtAuthzProtoCoverageHelper::recordFields(per_route_config), std::make_unique<FilterConfigPerRoute>(per_route_config));
 
   // Verify the per-route HTTP service configuration is correctly parsed
   EXPECT_TRUE(per_route_filter_config->httpService().has_value());
@@ -5822,7 +5881,7 @@ TEST_P(HttpFilterTestParam, PerRouteGrpcClientCreationNoServerContext) {
       ->set_cluster_name("per_route_grpc_cluster");
 
   std::unique_ptr<FilterConfigPerRoute> per_route_filter_config =
-      std::make_unique<FilterConfigPerRoute>(per_route_config);
+       (ExtAuthzProtoCoverageHelper::recordFields(per_route_config), std::make_unique<FilterConfigPerRoute>(per_route_config));
 
   ON_CALL(*decoder_filter_callbacks_.route_, mostSpecificPerFilterConfig(_))
       .WillByDefault(Return(per_route_filter_config.get()));
@@ -5874,7 +5933,7 @@ TEST_P(HttpFilterTestParam, PerRouteHttpClientCreationNoServerContext) {
       ->set_cluster("per_route_http_cluster");
 
   std::unique_ptr<FilterConfigPerRoute> per_route_filter_config =
-      std::make_unique<FilterConfigPerRoute>(per_route_config);
+       (ExtAuthzProtoCoverageHelper::recordFields(per_route_config), std::make_unique<FilterConfigPerRoute>(per_route_config));
 
   ON_CALL(*decoder_filter_callbacks_.route_, mostSpecificPerFilterConfig(_))
       .WillByDefault(Return(per_route_filter_config.get()));
@@ -5926,7 +5985,7 @@ TEST_F(HttpFilterTest, GrpcClientPerRouteError) {
   auto* grpc_service = per_route_config.mutable_check_settings()->mutable_grpc_service();
   grpc_service->mutable_envoy_grpc()->set_cluster_name("nonexistent_cluster");
 
-  FilterConfigPerRoute per_route_filter_config(per_route_config);
+  ExtAuthzProtoCoverageHelper::recordFields(per_route_config); FilterConfigPerRoute per_route_filter_config(per_route_config);
 
   // Set up route config to use the per-route configuration.
   ON_CALL(decoder_filter_callbacks_, mostSpecificPerFilterConfig())
@@ -5972,7 +6031,7 @@ TEST_F(HttpFilterTest, HttpClientPerRouteOverride) {
   http_service->mutable_server_uri()->set_cluster("per_route_http_cluster");
   http_service->set_path_prefix("/api/v2/auth");
 
-  FilterConfigPerRoute per_route_filter_config(per_route_config);
+  ExtAuthzProtoCoverageHelper::recordFields(per_route_config); FilterConfigPerRoute per_route_filter_config(per_route_config);
 
   // Set up route config to use the per-route configuration.
   ON_CALL(decoder_filter_callbacks_, mostSpecificPerFilterConfig())
@@ -6033,7 +6092,7 @@ TEST_P(HttpFilterTestParam, PerRouteGrpcClientTimeoutConfiguration) {
     grpc_service->mutable_timeout()->set_seconds(timeout_seconds);
 
     std::unique_ptr<FilterConfigPerRoute> per_route_filter_config =
-        std::make_unique<FilterConfigPerRoute>(per_route_config);
+         (ExtAuthzProtoCoverageHelper::recordFields(per_route_config), std::make_unique<FilterConfigPerRoute>(per_route_config));
 
     ON_CALL(*decoder_filter_callbacks_.route_, mostSpecificPerFilterConfig(_))
         .WillByDefault(Return(per_route_filter_config.get()));
@@ -6970,6 +7029,331 @@ TEST_F(HttpFilterTest, ShadowModeWithRequestBody) {
   EXPECT_EQ(1U, config_->stats().shadow_denied_.value());
 }
 
+<<<<<<< Updated upstream
+=======
+// Test that when headers size or count limits are reached during header removal, the response is
+// rejected. Note: Header removal usually reduces size/count, but headersWithinLimits is still
+// checked.
+TEST_F(HttpFilterTest, HeaderRemovalLimitReached) {
+  InSequence s;
+
+  initialize(R"EOF(
+  grpc_service:
+    envoy_grpc:
+      cluster_name: "ext_authz_server"
+  )EOF");
+
+  // Create a header map that is ALREADY over the limit.
+  // We'll use 3 headers with a max count of 2.
+  auto limited_headers = Http::TestRequestHeaderMapImpl(
+      {{":method", "GET"}, {":path", "/"}, {"some-header", "value"}, {"another-header", "value"}},
+      100, 2);
+
+  prepareCheck();
+
+  EXPECT_CALL(*client_, check(_, _, _, _))
+      .WillOnce(
+          Invoke([&](Filters::Common::ExtAuthz::RequestCallbacks& callbacks,
+                     const envoy::service::auth::v3::CheckRequest&, Tracing::Span&,
+                     const StreamInfo::StreamInfo&) -> void { request_callbacks_ = &callbacks; }));
+
+  EXPECT_EQ(Http::FilterHeadersStatus::StopAllIterationAndWatermark,
+            filter_->decodeHeaders(limited_headers, false));
+
+  EXPECT_CALL(decoder_filter_callbacks_, continueDecoding()).Times(0);
+  EXPECT_CALL(decoder_filter_callbacks_, encodeHeaders_(_, true))
+      .WillOnce(Invoke([&](const Http::ResponseHeaderMap& headers, bool) -> void {
+        EXPECT_EQ(headers.getStatusValue(),
+                  std::to_string(enumToInt(Http::Code::InternalServerError)));
+      }));
+
+  Filters::Common::ExtAuthz::Response response{};
+  response.status = Filters::Common::ExtAuthz::CheckStatus::OK;
+  // Remove one header. Even after removal, 3 headers remain, which is > 2.
+  response.headers_to_remove = {"some-header"};
+
+  request_callbacks_->onComplete(std::make_unique<Filters::Common::ExtAuthz::Response>(response));
+  EXPECT_EQ(1U, config_->stats().request_header_limits_reached_.value());
+}
+
+// Test that when headers size or count limits are reached during query parameter modification, the
+// response is rejected.
+TEST_F(HttpFilterTest, QueryParameterModificationLimitReached) {
+  InSequence s;
+
+  initialize(R"EOF(
+  grpc_service:
+    envoy_grpc:
+      cluster_name: "ext_authz_server"
+  )EOF");
+
+  // Create a header map with very low limits.
+  auto limited_headers =
+      Http::TestRequestHeaderMapImpl({{"some-header", "value"}, {"another-header", "value"}}, 1, 1);
+  limited_headers.setPath("/path");
+
+  prepareCheck();
+
+  EXPECT_CALL(*client_, check(_, _, _, _))
+      .WillOnce(
+          Invoke([&](Filters::Common::ExtAuthz::RequestCallbacks& callbacks,
+                     const envoy::service::auth::v3::CheckRequest&, Tracing::Span&,
+                     const StreamInfo::StreamInfo&) -> void { request_callbacks_ = &callbacks; }));
+
+  EXPECT_EQ(Http::FilterHeadersStatus::StopAllIterationAndWatermark,
+            filter_->decodeHeaders(limited_headers, false));
+
+  EXPECT_CALL(decoder_filter_callbacks_, continueDecoding()).Times(0);
+  EXPECT_CALL(decoder_filter_callbacks_, encodeHeaders_(_, true))
+      .WillOnce(Invoke([&](const Http::ResponseHeaderMap& headers, bool) -> void {
+        EXPECT_EQ(headers.getStatusValue(),
+                  std::to_string(enumToInt(Http::Code::InternalServerError)));
+      }));
+
+  Filters::Common::ExtAuthz::Response response{};
+  response.status = Filters::Common::ExtAuthz::CheckStatus::OK;
+  response.query_parameters_to_set = {{"foo", "bar"}};
+
+  request_callbacks_->onComplete(std::make_unique<Filters::Common::ExtAuthz::Response>(response));
+  EXPECT_EQ(1U, config_->stats().request_header_limits_reached_.value());
+}
+
+// Test that when response header limits are reached during encodeHeaders, the response is rejected.
+TEST_F(HttpFilterTest, ResponseHeaderLimitReachedDuringEncode) {
+  InSequence s;
+
+  initialize(R"EOF(
+  grpc_service:
+    envoy_grpc:
+      cluster_name: "ext_authz_server"
+  enforce_response_header_limits: true
+  )EOF");
+
+  prepareCheck();
+
+  EXPECT_CALL(*client_, check(_, _, _, _))
+      .WillOnce(
+          Invoke([&](Filters::Common::ExtAuthz::RequestCallbacks& callbacks,
+                     const envoy::service::auth::v3::CheckRequest&, Tracing::Span&,
+                     const StreamInfo::StreamInfo&) -> void { request_callbacks_ = &callbacks; }));
+
+  EXPECT_EQ(Http::FilterHeadersStatus::StopAllIterationAndWatermark,
+            filter_->decodeHeaders(request_headers_, false));
+
+  Filters::Common::ExtAuthz::Response response{};
+  response.status = Filters::Common::ExtAuthz::CheckStatus::OK;
+  response.response_headers_to_add = {{"x-new-header", "value"}};
+
+  EXPECT_CALL(decoder_filter_callbacks_, continueDecoding());
+  request_callbacks_->onComplete(std::make_unique<Filters::Common::ExtAuthz::Response>(response));
+
+  // Now trigger encodeHeaders with a limited map.
+  Http::TestResponseHeaderMapImpl response_headers({{":status", "200"}}, 100, 1);
+
+  EXPECT_CALL(encoder_filter_callbacks_,
+              sendLocalReply(Http::Code::InternalServerError, _, _, _, _));
+
+  EXPECT_EQ(Http::FilterHeadersStatus::StopIteration,
+            filter_->encodeHeaders(response_headers, false));
+  EXPECT_EQ(1U, config_->stats().response_header_limits_reached_.value());
+}
+
+// Test that when saw_invalid_append_actions is true and validate_mutations is true, the response is
+// rejected.
+TEST_F(HttpFilterTest, InvalidAppendActionRejected) {
+  InSequence s;
+
+  initialize(R"EOF(
+  grpc_service:
+    envoy_grpc:
+      cluster_name: "ext_authz_server"
+  validate_mutations: true
+  )EOF");
+
+  prepareCheck();
+
+  EXPECT_CALL(*client_, check(_, _, _, _))
+      .WillOnce(
+          Invoke([&](Filters::Common::ExtAuthz::RequestCallbacks& callbacks,
+                     const envoy::service::auth::v3::CheckRequest&, Tracing::Span&,
+                     const StreamInfo::StreamInfo&) -> void { request_callbacks_ = &callbacks; }));
+
+  EXPECT_EQ(Http::FilterHeadersStatus::StopAllIterationAndWatermark,
+            filter_->decodeHeaders(request_headers_, false));
+
+  EXPECT_CALL(decoder_filter_callbacks_, continueDecoding()).Times(0);
+  EXPECT_CALL(decoder_filter_callbacks_, encodeHeaders_(_, true))
+      .WillOnce(Invoke([&](const Http::ResponseHeaderMap& headers, bool) -> void {
+        EXPECT_EQ(headers.getStatusValue(),
+                  std::to_string(enumToInt(Http::Code::InternalServerError)));
+      }));
+
+  auto response = std::make_unique<Filters::Common::ExtAuthz::Response>();
+  response->status = Filters::Common::ExtAuthz::CheckStatus::OK;
+  response->saw_invalid_append_actions = true;
+
+  request_callbacks_->onComplete(std::move(response));
+  EXPECT_EQ(1U, config_->stats().invalid_.value());
+}
+
+// Test ExtAuthzLoggingInfo convenience methods.
+TEST(ExtAuthzLoggingInfoTestExtra, ConvenienceMethods) {
+  ExtAuthzLoggingInfo info(absl::nullopt);
+  info.setLatency(std::chrono::microseconds(100));
+  info.setBytesSent(200);
+  info.setBytesReceived(300);
+
+  info.clearLatency();
+  EXPECT_FALSE(info.latency().has_value());
+
+  info.clearBytesSent();
+  EXPECT_FALSE(info.bytesSent().has_value());
+
+  info.clearBytesReceived();
+  EXPECT_FALSE(info.bytesReceived().has_value());
+
+  info.setClusterInfo(std::make_shared<NiceMock<Upstream::MockClusterInfo>>());
+  info.clearClusterInfo();
+  EXPECT_EQ(nullptr, info.clusterInfo());
+
+  info.setUpstreamHost(std::make_shared<NiceMock<Upstream::MockHostDescription>>());
+  info.clearUpstreamHost();
+  EXPECT_EQ(nullptr, info.upstreamHost());
+}
+
+// Test fillMetadataContext (indirectly via initiateCall).
+TEST_F(HttpFilterTest, MetadataContextExtra) {
+  initialize(R"EOF(
+  grpc_service:
+    envoy_grpc:
+      cluster_name: "ext_authz_server"
+  metadata_context_namespaces: ["test"]
+  typed_metadata_context_namespaces: ["test_typed"]
+  )EOF");
+
+  envoy::config::core::v3::Metadata metadata;
+  EXPECT_CALL(decoder_filter_callbacks_.stream_info_, dynamicMetadata())
+      .WillRepeatedly(ReturnRef(metadata));
+  ON_CALL(decoder_filter_callbacks_, connection())
+      .WillByDefault(Return(OptRef<const Network::Connection>{connection_}));
+  EXPECT_CALL(connection_.stream_info_, dynamicMetadata()).WillRepeatedly(ReturnRef(metadata));
+
+  prepareCheck();
+  EXPECT_CALL(*client_, check(_, _, _, _));
+
+  EXPECT_EQ(Http::FilterHeadersStatus::StopAllIterationAndWatermark,
+            filter_->decodeHeaders(request_headers_, false));
+}
+
+// Test per-route gRPC client fallback when creation fails.
+TEST_F(HttpFilterTest, PerRouteGrpcClientFallback) {
+  initialize(R"EOF(
+  grpc_service:
+    envoy_grpc:
+      cluster_name: "ext_authz_server"
+  )EOF");
+
+  auto per_route_config = envoy::extensions::filters::http::ext_authz::v3::ExtAuthzPerRoute();
+  per_route_config.mutable_check_settings()
+      ->mutable_grpc_service()
+      ->mutable_envoy_grpc()
+      ->set_cluster_name("per_route_cluster");
+  auto config_per_route =  (ExtAuthzProtoCoverageHelper::recordFields(per_route_config), std::make_unique<FilterConfigPerRoute>(per_route_config));
+
+  Router::RouteSpecificFilterConfigs per_route_configs;
+  per_route_configs.push_back(config_per_route.get());
+  EXPECT_CALL(decoder_filter_callbacks_, perFilterConfigs())
+      .WillRepeatedly(Return(per_route_configs));
+
+  // Mock gRPC client manager to return error.
+  auto mock_grpc_client_manager = std::make_shared<Grpc::MockAsyncClientManager>();
+  ON_CALL(factory_context_, clusterManager()).WillByDefault(ReturnRef(cm_));
+  ON_CALL(cm_, grpcAsyncClientManager()).WillByDefault(ReturnRef(*mock_grpc_client_manager));
+
+  EXPECT_CALL(*mock_grpc_client_manager, getOrCreateRawAsyncClientWithHashKey(_, _, true))
+      .WillOnce(Return(absl::InternalError("failed")));
+
+  prepareCheck();
+  // Should fallback to default client.
+  EXPECT_CALL(*client_, check(_, _, _, _));
+
+  EXPECT_EQ(Http::FilterHeadersStatus::StopAllIterationAndWatermark,
+            filter_->decodeHeaders(request_headers_, false));
+}
+
+// Test shadow mode with disabled filter.
+TEST_F(HttpFilterTest, ShadowModeDisabledFilter) {
+  initialize(R"EOF(
+  grpc_service:
+    envoy_grpc:
+      cluster_name: "ext_authz_server"
+  filter_enabled:
+    runtime_key: "disabled"
+    default_value:
+      numerator: 0
+      denominator: HUNDRED
+  deny_at_disable:
+    default_value: true
+    runtime_key: "deny_at_disable"
+  shadow_mode: true
+  )EOF");
+
+  prepareCheck();
+
+  // Filter is disabled, but in shadow mode it should continue and set shadow filter state.
+  EXPECT_CALL(decoder_filter_callbacks_.stream_info_,
+              setResponseFlag(Envoy::StreamInfo::CoreResponseFlag::UnauthorizedExternalService));
+
+  EXPECT_EQ(Http::FilterHeadersStatus::Continue, filter_->decodeHeaders(request_headers_, false));
+
+  const auto* shadow =
+      decoder_filter_callbacks_.streamInfo().filterState()->getDataReadOnly<ShadowDecisionObject>(
+          absl::StrCat(FilterConfigName, ".shadow"));
+  ASSERT_NE(shadow, nullptr);
+  EXPECT_EQ(shadow->checkResult(),
+            envoy::extensions::filters::http::ext_authz::v3::ShadowDecision::DENIED);
+}
+
+/**
+ * Final test case to verify that all fields defined in ext_authz.proto are exercised
+ * across the test suite.
+ */
+TEST_F(HttpFilterTest, VerifyAllProtoFieldsCovered) {
+  const google::protobuf::Descriptor* descriptor =
+      envoy::extensions::filters::http::ext_authz::v3::ExtAuthz::descriptor();
+  const google::protobuf::Descriptor* per_route_descriptor =
+      envoy::extensions::filters::http::ext_authz::v3::ExtAuthzPerRoute::descriptor();
+
+  std::set<const google::protobuf::FieldDescriptor*> all_fields;
+  std::set<const google::protobuf::Descriptor*> visited;
+
+  ExtAuthzProtoCoverageHelper::collectAllFields(descriptor, all_fields, visited);
+  ExtAuthzProtoCoverageHelper::collectAllFields(per_route_descriptor, all_fields, visited);
+
+  std::vector<std::string> uncovered_fields;
+  for (const auto* field : all_fields) {
+    if (ExtAuthzProtoCoverageHelper::covered_fields_().find(field) ==
+        ExtAuthzProtoCoverageHelper::covered_fields_().end()) {
+      // We may want to ignore some fields that are hard to exercise or deprecated.
+      // For now, we list all of them to see what's missing.
+      if (field->options().deprecated()) {
+        continue;
+      }
+      uncovered_fields.push_back(std::string(field->full_name()));
+    }
+  }
+
+  if (!uncovered_fields.empty()) {
+    std::string error_message =
+        "The following fields in ext_authz.proto are not covered by any test case:\n";
+    for (const auto& field_name : uncovered_fields) {
+      error_message += "  " + field_name + "\n";
+    }
+    FAIL() << error_message;
+  }
+}
+
+>>>>>>> Stashed changes
 } // namespace
 } // namespace ExtAuthz
 } // namespace HttpFilters

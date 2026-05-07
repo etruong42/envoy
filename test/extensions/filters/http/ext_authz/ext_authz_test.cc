@@ -3430,6 +3430,40 @@ TEST_F(HttpFilterTest, RouteMetadataContext) {
               Not(Contains(Key("untyped.route.data"))));
 }
 
+// Verifies that specified bootstrap metadata is passed along in the check request labels.
+TEST_F(HttpFilterTest, BootstrapMetadataLabels) {
+  const std::string bootstrap_yaml = R"EOF(
+  node:
+    metadata:
+      labels:
+        label_1: value_1
+        label_2: value_2
+  )EOF";
+
+  TestUtility::loadFromYaml(bootstrap_yaml, factory_context_.bootstrap_);
+
+  initialize(R"EOF(
+  grpc_service:
+    envoy_grpc:
+      cluster_name: "ext_authz_server"
+  bootstrap_metadata_labels_key: "labels"
+  )EOF");
+
+  prepareCheck();
+
+  envoy::service::auth::v3::CheckRequest check_request;
+  EXPECT_CALL(*client_, check(_, _, _, _))
+      .WillOnce(
+          Invoke([&](Filters::Common::ExtAuthz::RequestCallbacks&,
+                     const envoy::service::auth::v3::CheckRequest& check_param, Tracing::Span&,
+                     const StreamInfo::StreamInfo&) -> void { check_request = check_param; }));
+
+  filter_->decodeHeaders(request_headers_, false);
+
+  EXPECT_EQ("value_1", check_request.attributes().destination().labels().at("label_1"));
+  EXPECT_EQ("value_2", check_request.attributes().destination().labels().at("label_2"));
+}
+
 // Test that filter can be disabled via the filter_enabled field.
 TEST_F(HttpFilterTest, FilterDisabled) {
   initialize(R"EOF(

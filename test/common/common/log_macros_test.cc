@@ -513,4 +513,46 @@ TEST(FineGrainLog, envoyFlushLogMacro) {
   loggable.doFlush();
 }
 
+namespace {
+// Helper function that uses ENVOY_LOG_TO_LOGGER.
+// In a real application, this might be a method in a base class or a shared utility.
+void sharedLogHelper(spdlog::logger& logger, absl::string_view message) {
+  ENVOY_LOG_TO_LOGGER(logger, info, "{}", message);
+}
+} // namespace
+
+TEST(FineGrainLog, CachingCorrectnessWithDynamicNames) {
+  Envoy::Thread::MutexBasicLockable lock;
+  // Initialize logging context with fine-grain logging enabled.
+  // Use a custom format that includes the logger name (%n) so we can verify it.
+  Logger::Context logging_context{spdlog::level::info, "[%n] %v", lock, false, true};
+
+  // We will use two different standard loggers.
+  spdlog::logger& admin_logger = Logger::Registry::getLog(Logger::Id::admin);
+  spdlog::logger& upstream_logger = Logger::Registry::getLog(Logger::Id::upstream);
+
+  // Define the keys that Fine-Grain logger will use.
+  const std::string admin_key = absl::StrCat(__FILE__, ":admin");
+  const std::string upstream_key = absl::StrCat(__FILE__, ":upstream");
+
+  // Ensure we start with a clean state for this file's loggers.
+  getFineGrainLogContext().removeFineGrainLogEntryForTest(admin_key);
+  getFineGrainLogContext().removeFineGrainLogEntryForTest(upstream_key);
+
+  // 1. Call the helper with the admin logger.
+  // This will initialize the static 'flogger' in sharedLogHelper with the admin fine-grain logger.
+  EXPECT_LOG_CONTAINS("", absl::StrCat("[", admin_key, "] message 1"),
+                      sharedLogHelper(admin_logger, "message 1"));
+
+  // 2. Call the helper with the upstream logger.
+  // With the fix, the static 'flogger' will be updated because checkFineGrainLogger will fail.
+  EXPECT_LOG_CONTAINS("", absl::StrCat("[", upstream_key, "] message 2"),
+                      sharedLogHelper(upstream_logger, "message 2"));
+
+  // 3. Call the helper with the admin logger again.
+  // It should correctly switch back to admin.
+  EXPECT_LOG_CONTAINS("", absl::StrCat("[", admin_key, "] message 3"),
+                      sharedLogHelper(admin_logger, "message 3"));
+}
+
 } // namespace Envoy

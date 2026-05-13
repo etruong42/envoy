@@ -145,12 +145,6 @@ public:
   static bool safeFileNameMatch(absl::string_view pattern, absl::string_view str);
 
   /**
-   * Check if a logger's name matches the given file and logger name.
-   */
-  bool checkFineGrainLogger(spdlog::logger* logger, absl::string_view file, absl::string_view name)
-      ABSL_LOCKS_EXCLUDED(fine_grain_log_lock_);
-
-  /**
    * Remove a fine grain log entry for testing only.
    */
   void removeFineGrainLogEntryForTest(absl::string_view key)
@@ -238,15 +232,19 @@ FineGrainLogContext& getFineGrainLogContext();
     } else {                                                                                       \
       static std::atomic<const char*> cached_name_ptr{nullptr};                                    \
       const char* current_ptr = name.data();                                                       \
+      const char* last_ptr = cached_name_ptr.load(std::memory_order_relaxed);                      \
       if (ABSL_PREDICT_FALSE(!local_flogger ||                                                     \
-                               cached_name_ptr.load(std::memory_order_relaxed) != current_ptr)) {  \
-        if (!local_flogger ||                                                                      \
-            !::Envoy::getFineGrainLogContext().checkFineGrainLogger(local_flogger, __FILE__, name)) { \
+                               (last_ptr != current_ptr &&                                         \
+                                last_ptr != reinterpret_cast<const char*>(1)))) {                  \
+        if (local_flogger == nullptr) {                                                            \
           local_flogger =                                                                          \
-              ::Envoy::getFineGrainLogContext().initFineGrainLogger(__FILE__, name, flogger);       \
-        }                                                                                          \
-        if (local_flogger) {                                                                       \
+              ::Envoy::getFineGrainLogContext().initFineGrainLogger(__FILE__, name, flogger);      \
           cached_name_ptr.store(current_ptr, std::memory_order_relaxed);                           \
+        } else {                                                                                   \
+          /* Toggling NAME detected: Fallback to filename-only logger and latch to this state. */  \
+          local_flogger =                                                                          \
+              ::Envoy::getFineGrainLogContext().initFineGrainLogger(__FILE__, "", flogger);        \
+          cached_name_ptr.store(reinterpret_cast<const char*>(1), std::memory_order_relaxed);      \
         }                                                                                          \
       }                                                                                            \
     }                                                                                              \

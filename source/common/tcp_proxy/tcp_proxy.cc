@@ -290,8 +290,8 @@ Config::Config(const envoy::extensions::filters::network::tcp_proxy::v3::TcpProx
 RouteConstSharedPtr Config::getRegularRouteFromEntries(Network::Connection& connection) {
   // First check if the per-connection state to see if we need to route to a pre-selected cluster
   if (const auto* per_connection_cluster =
-          connection.streamInfo().filterState()->getDataReadOnly<PerConnectionCluster>(
-              PerConnectionCluster::key());
+          connection.streamInfo().filterState()->getIndexedDataReadOnly<PerConnectionCluster>(
+              StreamInfo::FilterStateIndex::TcpProxyCluster);
       per_connection_cluster != nullptr) {
     return std::make_shared<const SimpleRouteImpl>(*this, per_connection_cluster->value());
   }
@@ -1159,8 +1159,8 @@ Network::FilterStatus Filter::onNewConnection() {
 
   idle_timeout_ = config_->idleTimeout();
   if (const auto* per_connection_idle_timeout =
-          getStreamInfo().filterState()->getDataReadOnly<StreamInfo::UInt64Accessor>(
-              PerConnectionIdleTimeoutMs);
+          getStreamInfo().filterState()->getIndexedDataReadOnly<StreamInfo::UInt64Accessor>(
+              StreamInfo::FilterStateIndex::TcpProxyPerConnectionIdleTimeoutMs);
       per_connection_idle_timeout != nullptr) {
     idle_timeout_ = std::chrono::milliseconds(per_connection_idle_timeout->value());
   }

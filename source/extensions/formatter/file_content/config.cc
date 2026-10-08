@@ -25,11 +25,11 @@ public:
       Config::DataSource::DataSourceProviderSharedPtr<std::string> provider)
       : provider_(std::move(provider)) {}
 
-  absl::optional<std::string> format(const Envoy::Formatter::Context&,
-                                     const StreamInfo::StreamInfo&) const override {
+  std::optional<std::string> format(const Envoy::Formatter::Context&,
+                                    const StreamInfo::StreamInfo&) const override {
     const auto data = provider_->data();
     if (!data) {
-      return absl::nullopt;
+      return std::nullopt;
     }
     return *data;
   }
@@ -42,6 +42,25 @@ public:
       val.set_string_value(*opt);
     }
     return val;
+  }
+
+  bool formatTo(std::string& sink, const Envoy::Formatter::Context&,
+                const StreamInfo::StreamInfo&) const override {
+    const auto data = provider_->data();
+    if (!data) {
+      return false;
+    }
+    sink.append(*data);
+    return true;
+  }
+
+  void formatValueTo(Envoy::Formatter::ValueSink& sink, const Envoy::Formatter::Context&,
+                     const StreamInfo::StreamInfo&) const override {
+    const auto data = provider_->data();
+    if (!data) {
+      return;
+    }
+    sink.addString(*data);
   }
 
 private:
@@ -59,9 +78,9 @@ public:
   explicit FileContentCommandParser(Server::Configuration::ServerFactoryContext& server_context)
       : server_context_(server_context) {}
 
-  Envoy::Formatter::FormatterProviderPtr parse(absl::string_view command,
-                                               absl::string_view subcommand,
-                                               absl::optional<size_t> max_length) const override {
+  absl::StatusOr<Envoy::Formatter::FormatterProviderPtr>
+  parse(absl::string_view command, absl::string_view subcommand,
+        std::optional<size_t> max_length) const override {
     if (command != FileContentCommand) {
       return nullptr;
     }

@@ -15,6 +15,7 @@ public:
 
   // Server::HotRestart
   MOCK_METHOD(void, drainParentListeners, ());
+  MOCK_METHOD(bool, parentStopAcceptingRequested, ());
   MOCK_METHOD(int, duplicateParentListenSocket,
               (const std::string& address, uint32_t worker_index,
                absl::string_view network_namespace));
@@ -24,7 +25,7 @@ public:
   MOCK_METHOD(OptRef<Network::ParentDrainedCallbackRegistrar>, parentDrainedCallbackRegistrar, ());
   MOCK_METHOD(void, whenDrainComplete, (absl::string_view addr, absl::AnyInvocable<void()> action));
   MOCK_METHOD(void, initialize, (Event::Dispatcher & dispatcher, Server::Instance& server));
-  MOCK_METHOD(absl::optional<AdminShutdownResponse>, sendParentAdminShutdownRequest, ());
+  MOCK_METHOD(std::optional<AdminShutdownResponse>, sendParentAdminShutdownRequest, ());
   MOCK_METHOD(void, sendParentTerminateRequest, ());
   MOCK_METHOD(ServerStatsFromParent, mergeParentStatsIfAny, (Stats::StoreRoot & stats_store));
   MOCK_METHOD(void, shutdown, ());

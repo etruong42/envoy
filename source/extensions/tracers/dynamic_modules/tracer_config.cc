@@ -39,8 +39,8 @@ DynamicModuleTracerConfig::DynamicModuleTracerConfig(
     const absl::string_view metrics_namespace,
     Extensions::DynamicModules::DynamicModulePtr dynamic_module, Stats::Scope& stats_scope)
     : stats_scope_(stats_scope.createScope(absl::StrCat(metrics_namespace, "."))),
-      stat_name_pool_(stats_scope_->symbolTable()), tracer_name_(tracer_name),
-      tracer_config_(tracer_config), dynamic_module_(std::move(dynamic_module)) {}
+      metrics_(*stats_scope_), tracer_name_(tracer_name), tracer_config_(tracer_config),
+      dynamic_module_(std::move(dynamic_module)) {}
 
 DynamicModuleTracerConfig::~DynamicModuleTracerConfig() {
   if (in_module_config_ != nullptr && on_config_destroy_ != nullptr) {
@@ -75,6 +75,16 @@ absl::StatusOr<DynamicModuleTracerConfigSharedPtr> newDynamicModuleTracerConfig(
   RESOLVE_OR_RETURN(on_start_span_, "envoy_dynamic_module_on_tracer_start_span");
   RESOLVE_OR_RETURN(on_span_set_operation_, "envoy_dynamic_module_on_tracer_span_set_operation");
   RESOLVE_OR_RETURN(on_span_set_tag_, "envoy_dynamic_module_on_tracer_span_set_tag");
+  // reserve_tags was added after v1.39.0, so resolve it optionally to keep loading tracer modules
+  // built against an older SDK. The field keeps its null default when absent and the call site
+  // skips it.
+  {
+    auto reserve_tags = config->dynamic_module_->getFunctionPointer<OnTracerSpanReserveTagsType>(
+        "envoy_dynamic_module_on_tracer_span_reserve_tags");
+    if (reserve_tags.ok()) {
+      config->on_span_reserve_tags_ = reserve_tags.value();
+    }
+  }
   RESOLVE_OR_RETURN(on_span_log_, "envoy_dynamic_module_on_tracer_span_log");
   RESOLVE_OR_RETURN(on_span_finish_, "envoy_dynamic_module_on_tracer_span_finish");
   RESOLVE_OR_RETURN(on_span_inject_context_, "envoy_dynamic_module_on_tracer_span_inject_context");
@@ -101,6 +111,7 @@ absl::StatusOr<DynamicModuleTracerConfigSharedPtr> newDynamicModuleTracerConfig(
   if (config->in_module_config_ == nullptr) {
     return absl::InvalidArgumentError("Failed to initialize dynamic module tracer config");
   }
+  config->stat_creation_frozen_ = true;
   return config;
 }
 
@@ -134,6 +145,13 @@ void DynamicModuleSpan::setTag(absl::string_view name, absl::string_view value) 
   config_->on_span_set_tag_(in_module_span_, key_buf, val_buf);
 }
 
+void DynamicModuleSpan::reserveTags(size_t size) {
+  // Skipped when the module was built against an SDK that predates this hook.
+  if (config_->on_span_reserve_tags_ != nullptr) {
+    config_->on_span_reserve_tags_(in_module_span_, size);
+  }
+}
+
 void DynamicModuleSpan::log(SystemTime timestamp, const std::string& event) {
   const int64_t timestamp_ns =
       std::chrono::duration_cast<std::chrono::nanoseconds>(timestamp.time_since_epoch()).count();
@@ -141,6 +159,8 @@ void DynamicModuleSpan::log(SystemTime timestamp, const std::string& event) {
                                                       .length = event.size()};
   config_->on_span_log_(in_module_span_, timestamp_ns, event_buf);
 }
+
+bool DynamicModuleSpan::exportedSpan() const { return sampled_; }
 
 void DynamicModuleSpan::finishSpan() { config_->on_span_finish_(in_module_span_); }
 
@@ -167,6 +187,7 @@ Tracing::SpanPtr DynamicModuleSpan::spawnChild(const Tracing::Config&, const std
 }
 
 void DynamicModuleSpan::setSampled(bool sampled) {
+  sampled_ = sampled;
   config_->on_span_set_sampled_(in_module_span_, sampled);
 }
 
@@ -180,6 +201,7 @@ std::string DynamicModuleSpan::getBaggage(absl::string_view key) {
   envoy_dynamic_module_type_module_buffer value_out = {.ptr = nullptr, .length = 0};
   if (config_->on_span_get_baggage_(in_module_span_, key_buf, &value_out) &&
       value_out.ptr != nullptr) {
+    // NOLINTNEXTLINE(modernize-return-braced-init-list)
     return std::string(value_out.ptr, value_out.length);
   }
   return {};
@@ -196,6 +218,7 @@ void DynamicModuleSpan::setBaggage(absl::string_view key, absl::string_view valu
 std::string DynamicModuleSpan::getTraceId() const {
   envoy_dynamic_module_type_module_buffer value_out = {.ptr = nullptr, .length = 0};
   if (config_->on_span_get_trace_id_(in_module_span_, &value_out) && value_out.ptr != nullptr) {
+    // NOLINTNEXTLINE(modernize-return-braced-init-list)
     return std::string(value_out.ptr, value_out.length);
   }
   return {};
@@ -204,6 +227,7 @@ std::string DynamicModuleSpan::getTraceId() const {
 std::string DynamicModuleSpan::getSpanId() const {
   envoy_dynamic_module_type_module_buffer value_out = {.ptr = nullptr, .length = 0};
   if (config_->on_span_get_span_id_(in_module_span_, &value_out) && value_out.ptr != nullptr) {
+    // NOLINTNEXTLINE(modernize-return-braced-init-list)
     return std::string(value_out.ptr, value_out.length);
   }
   return {};

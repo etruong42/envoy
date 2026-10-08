@@ -2,6 +2,8 @@
 
 #include "source/common/network/utility.h"
 
+// NOLINT: cache-bust for corrupt RBE artifact, remove this on any change to this file.
+
 using testing::_;
 using testing::Invoke;
 using testing::Return;
@@ -30,11 +32,20 @@ MockDetector::~MockDetector() = default;
 MockHealthCheckHostMonitor::MockHealthCheckHostMonitor() = default;
 MockHealthCheckHostMonitor::~MockHealthCheckHostMonitor() = default;
 
+MockHostLbPolicyData::MockHostLbPolicyData(bool receives_orca_load_report)
+    : receives_orca_load_report_(receives_orca_load_report) {}
+MockHostLbPolicyData::~MockHostLbPolicyData() = default;
+
 MockHostDescription::MockHostDescription()
     : address_(*Network::Utility::resolveUrl("tcp://10.0.0.1:443")),
       socket_factory_(new testing::NiceMock<Network::MockTransportSocketFactory>) {
+  observability_name_ = address_->asString();
   ON_CALL(*this, hostname()).WillByDefault(ReturnRef(hostname_));
+  ON_CALL(*this, observabilityName()).WillByDefault(Invoke([this]() {
+    return absl::string_view(observability_name_);
+  }));
   ON_CALL(*this, address()).WillByDefault(Return(address_));
+  ON_CALL(*this, orcaReportingAddress()).WillByDefault(Invoke([this]() { return address(); }));
   ON_CALL(*this, outlierDetector()).WillByDefault(ReturnRef(outlier_detector_));
   ON_CALL(*this, stats()).WillByDefault(ReturnRef(stats_));
   ON_CALL(*this, loadMetricStats()).WillByDefault(ReturnRef(load_metric_stats_));
@@ -59,17 +70,25 @@ MockHostDescription::MockHostDescription()
         if (index >= lb_policy_datas_.size()) {
           return {};
         }
-        return OptRef<HostLbPolicyData>(*lb_policy_datas_[index]);
+        return {*lb_policy_datas_[index]};
       }));
 }
 
 MockHostDescription::~MockHostDescription() = default;
 
-MockHostLight::MockHostLight() = default;
+MockHostLight::MockHostLight() {
+  ON_CALL(*this, observabilityName()).WillByDefault(Invoke([this]() {
+    return absl::string_view(observability_name_);
+  }));
+}
 MockHostLight::~MockHostLight() = default;
 
 MockHost::MockHost() : socket_factory_(new testing::NiceMock<Network::MockTransportSocketFactory>) {
+  ON_CALL(*this, observabilityName()).WillByDefault(Invoke([this]() {
+    return absl::string_view(observability_name_);
+  }));
   ON_CALL(*this, cluster()).WillByDefault(ReturnRef(cluster_));
+  ON_CALL(*this, orcaReportingAddress()).WillByDefault(Invoke([this]() { return address(); }));
   ON_CALL(*this, outlierDetector()).WillByDefault(ReturnRef(outlier_detector_));
   ON_CALL(*this, stats()).WillByDefault(ReturnRef(stats_));
   ON_CALL(*this, loadMetricStats()).WillByDefault(ReturnRef(load_metric_stats_));
@@ -88,7 +107,7 @@ MockHost::MockHost() : socket_factory_(new testing::NiceMock<Network::MockTransp
         if (index >= lb_policy_datas_.size()) {
           return {};
         }
-        return OptRef<HostLbPolicyData>(*lb_policy_datas_[index]);
+        return {*lb_policy_datas_[index]};
       }));
 }
 

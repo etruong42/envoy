@@ -2,6 +2,9 @@
 
 #include "envoy/common/exception.h"
 
+#include "source/extensions/dynamic_modules/abi_context_accessors.h"
+#include "source/extensions/dynamic_modules/worker_index.h"
+
 namespace Envoy {
 namespace Extensions {
 namespace AccessLoggers {
@@ -34,12 +37,8 @@ DynamicModuleAccessLog::DynamicModuleAccessLog(AccessLog::FilterPtr&& filter,
       auto concurrency = context->options().concurrency();
       worker_index = concurrency; // Set main/test thread on free index.
     } else {
-      const std::string& worker_name = dispatcher.name();
-      auto pos = worker_name.find_first_of('_');
-      ENVOY_BUG(pos != std::string::npos, "worker name is not in expected format worker_{index}");
-      if (!absl::SimpleAtoi(worker_name.substr(pos + 1), &worker_index)) {
-        IS_ENVOY_BUG("failed to parse worker index from name");
-      }
+      worker_index =
+          Extensions::DynamicModules::parseWorkerIndexFromDispatcherName(dispatcher.name());
     }
     // Create a thread-local logger wrapper first, then pass it to the module.
     auto tl_logger = std::make_shared<ThreadLocalLogger>(nullptr, config, worker_index);
@@ -59,9 +58,8 @@ void DynamicModuleAccessLog::emitLog(const Formatter::Context& context,
   tl_logger.log_context_ = &context;
   tl_logger.stream_info_ = &stream_info;
 
-  // Convert AccessLogType to ABI enum. The cast is safe because enum values are aligned.
   const auto abi_log_type =
-      static_cast<envoy_dynamic_module_type_access_log_type>(context.accessLogType());
+      Extensions::DynamicModules::ContextAccessor::accessLogTypeToAbi(context.accessLogType());
 
   // Invoke the module's log callback with the context pointer.
   config_->on_logger_log_(tl_logger.thisAsVoidPtr(), tl_logger.logger_, abi_log_type);

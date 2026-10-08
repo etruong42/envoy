@@ -28,10 +28,10 @@ public:
   ~MockDetectorHostMonitor() override;
 
   MOCK_METHOD(uint32_t, numEjections, ());
-  MOCK_METHOD(void, putResult, (Result result, absl::optional<uint64_t> code));
+  MOCK_METHOD(void, putResult, (Result result, std::optional<uint64_t> code));
   MOCK_METHOD(void, putResponseTime, (std::chrono::milliseconds time));
-  MOCK_METHOD(const absl::optional<MonotonicTime>&, lastEjectionTime, ());
-  MOCK_METHOD(const absl::optional<MonotonicTime>&, lastUnejectionTime, ());
+  MOCK_METHOD(const std::optional<MonotonicTime>&, lastEjectionTime, ());
+  MOCK_METHOD(const std::optional<MonotonicTime>&, lastUnejectionTime, ());
   MOCK_METHOD(double, successRate, (DetectorHostMonitor::SuccessRateMonitorType type), (const));
   MOCK_METHOD(void, successRate,
               (DetectorHostMonitor::SuccessRateMonitorType type, double new_success_rate));
@@ -77,6 +77,19 @@ public:
   MOCK_METHOD(void, setUnhealthy, (UnhealthyType));
 };
 
+class MockHostLbPolicyData : public HostLbPolicyData {
+public:
+  explicit MockHostLbPolicyData(bool receives_orca_load_report = true);
+  ~MockHostLbPolicyData() override;
+
+  bool receivesOrcaLoadReport() const override { return receives_orca_load_report_; }
+  MOCK_METHOD(absl::Status, onOrcaLoadReport,
+              (const OrcaLoadReport& report, OptRef<const StreamInfo::StreamInfo> stream_info),
+              (override));
+
+  const bool receives_orca_load_report_;
+};
+
 class MockHostDescription : public HostDescription {
 public:
   MockHostDescription();
@@ -85,6 +98,7 @@ public:
   MOCK_METHOD(Network::Address::InstanceConstSharedPtr, address, (), (const));
   MOCK_METHOD(SharedConstAddressVector, addressListOrNull, (), (const));
   MOCK_METHOD(Network::Address::InstanceConstSharedPtr, healthCheckAddress, (), (const));
+  MOCK_METHOD(Network::Address::InstanceConstSharedPtr, orcaReportingAddress, (), (const));
   MOCK_METHOD(bool, canary, (), (const));
   MOCK_METHOD(void, canary, (bool new_canary));
   MOCK_METHOD(MetadataConstSharedPtr, metadata, (), (const));
@@ -99,13 +113,14 @@ public:
   MOCK_METHOD(void, setHealthChecker, (HealthCheckHostMonitorPtr && health_checker));
   MOCK_METHOD(const std::string&, hostnameForHealthChecks, (), (const));
   MOCK_METHOD(const std::string&, hostname, (), (const));
+  MOCK_METHOD(absl::string_view, observabilityName, (), (const));
   MOCK_METHOD(Network::UpstreamTransportSocketFactory&, transportSocketFactory, (), (const));
   MOCK_METHOD(HostStats&, stats, (), (const));
   MOCK_METHOD(LoadMetricStats&, loadMetricStats, (), (const));
   MOCK_METHOD(const envoy::config::core::v3::Locality&, locality, (), (const));
   MOCK_METHOD(uint32_t, priority, (), (const));
   MOCK_METHOD(void, priority, (uint32_t));
-  MOCK_METHOD(absl::optional<MonotonicTime>, lastHcPassTime, (), (const));
+  MOCK_METHOD(std::optional<MonotonicTime>, lastHcPassTime, (), (const));
   MOCK_METHOD(void, setLastHcPassTime, (MonotonicTime last_hc_pass_time));
   Stats::StatName localityZoneStatName() const override {
     locality_zone_stat_name_ =
@@ -122,6 +137,7 @@ public:
   MOCK_METHOD(OptRef<HostLbPolicyData>, lbPolicyDataAt, (size_t index), (const));
 
   std::string hostname_;
+  std::string observability_name_;
   Network::Address::InstanceConstSharedPtr address_;
   testing::NiceMock<Outlier::MockDetectorHostMonitor> outlier_detector_;
   testing::NiceMock<MockHealthCheckHostMonitor> health_checker_;
@@ -144,7 +160,7 @@ public:
 
   struct MockCreateConnectionData {
     Network::ClientConnection* connection_{};
-    HostDescriptionConstSharedPtr host_description_{};
+    HostDescriptionConstSharedPtr host_description_;
   };
 
   CreateConnectionData
@@ -163,6 +179,15 @@ public:
     return {Network::ClientConnectionPtr{data.connection_}, data.host_description_};
   }
 
+  CreateConnectionData
+  createOrcaReportingConnection(Event::Dispatcher& dispatcher,
+                                Network::TransportSocketOptionsConstSharedPtr,
+                                Network::UpstreamTransportSocketFactory&,
+                                Network::Address::InstanceConstSharedPtr) const override {
+    MockCreateConnectionData data = createConnection_(dispatcher, nullptr);
+    return {Network::ClientConnectionPtr{data.connection_}, data.host_description_};
+  }
+
   bool disableActiveHealthCheck() const override { return disable_active_health_check_; }
   void setDisableActiveHealthCheck(bool disable_active_health_check) override {
     disable_active_health_check_ = disable_active_health_check;
@@ -171,6 +196,7 @@ public:
   MOCK_METHOD(Network::Address::InstanceConstSharedPtr, address, (), (const));
   MOCK_METHOD(SharedConstAddressVector, addressListOrNull, (), (const));
   MOCK_METHOD(Network::Address::InstanceConstSharedPtr, healthCheckAddress, (), (const));
+  MOCK_METHOD(Network::Address::InstanceConstSharedPtr, orcaReportingAddress, (), (const));
   MOCK_METHOD(bool, canary, (), (const));
   MOCK_METHOD(void, canary, (bool new_canary));
   MOCK_METHOD(MetadataConstSharedPtr, metadata, (), (const));
@@ -200,6 +226,7 @@ public:
 
   MOCK_METHOD(const std::string&, hostnameForHealthChecks, (), (const));
   MOCK_METHOD(const std::string&, hostname, (), (const));
+  MOCK_METHOD(absl::string_view, observabilityName, (), (const));
   MOCK_METHOD(Network::UpstreamTransportSocketFactory&, transportSocketFactory, (), (const));
   MOCK_METHOD(Outlier::DetectorHostMonitor&, outlierDetector, (), (const));
   MOCK_METHOD(void, setHealthChecker, (HealthCheckHostMonitorPtr && health_checker));
@@ -217,14 +244,15 @@ public:
   MOCK_METHOD(uint32_t, priority, (), (const));
   MOCK_METHOD(void, priority, (uint32_t));
   MOCK_METHOD(bool, warmed, (), (const));
-  MOCK_METHOD(absl::optional<MonotonicTime>, lastHcPassTime, (), (const));
+  MOCK_METHOD(std::optional<MonotonicTime>, lastHcPassTime, (), (const));
   MOCK_METHOD(void, addLbPolicyData, (HostLbPolicyDataPtr lb_policy_data));
   MOCK_METHOD(size_t, lbPolicyDataCount, (), (const));
   MOCK_METHOD(OptRef<HostLbPolicyData>, lbPolicyDataAt, (size_t index), (const));
   MOCK_METHOD(void, setLastHealthCheckHttpStatus, (uint64_t));
-  MOCK_METHOD(absl::optional<uint64_t>, lastHealthCheckHttpStatus, (), (const));
+  MOCK_METHOD(std::optional<uint64_t>, lastHealthCheckHttpStatus, (), (const));
 
   bool disable_active_health_check_ = false;
+  std::string observability_name_;
 };
 
 class MockHost : public MockHostLight {

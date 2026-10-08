@@ -93,7 +93,7 @@ public:
 private:
   bool resetUpstreamHandleIfSet();
 
-  absl::optional<Envoy::Upstream::TcpPoolData> conn_pool_data_;
+  std::optional<Envoy::Upstream::TcpPoolData> conn_pool_data_;
   Envoy::Tcp::ConnectionPool::Cancellable* upstream_handle_{};
   Router::GenericConnectionPoolCallbacks* callbacks_{};
   BridgeConfigSharedPtr config_;
@@ -137,8 +137,8 @@ public:
 
   // Accessors for ABI callbacks.
   const Envoy::Http::RequestHeaderMap* requestHeaders() const { return request_headers_; }
-  Buffer::Instance* requestBuffer() { return request_buffer_; }
-  Buffer::Instance* responseBuffer() { return response_buffer_; }
+  Buffer::Instance* requestBuffer() { return &request_buffer_; }
+  Buffer::Instance* responseBuffer() { return &response_buffer_; }
 
   // Called by ABI callbacks to send data upstream.
   void sendUpstreamData(absl::string_view data, bool end_stream);
@@ -166,6 +166,13 @@ private:
                        envoy_dynamic_module_type_module_http_header* headers_vector,
                        size_t headers_vector_size);
 
+  // Applies a terminal downstream response captured during a module hook. This may destroy the
+  // bridge, so callers must invoke it last and touch no member afterwards.
+  void applyPendingResponse();
+
+  // A terminal downstream response captured during a module hook.
+  enum class PendingResponse { None, Response, Headers, Data, Trailers };
+
   Router::UpstreamToDownstream* upstream_request_;
   Envoy::Tcp::ConnectionPool::ConnectionDataPtr upstream_conn_data_;
   BridgeConfigSharedPtr config_;
@@ -173,9 +180,22 @@ private:
 
   bool downstream_complete_ = false;
 
+  // True only while a module event hook is on the stack. A terminal downstream response requested
+  // during a hook is deferred while this is set and applied after the hook returns, so the router
+  // never resets and destroys this bridge underneath a live module borrow.
+  bool in_module_hook_ = false;
+
+  PendingResponse pending_response_ = PendingResponse::None;
+  Envoy::Http::ResponseHeaderMapPtr pending_headers_;
+  Envoy::Http::ResponseTrailerMapPtr pending_trailers_;
+  std::string pending_body_;
+
   const Envoy::Http::RequestHeaderMap* request_headers_ = nullptr;
-  Buffer::Instance* request_buffer_ = nullptr;
-  Buffer::Instance* response_buffer_ = nullptr;
+  // Owned copies of the data passed to the module so the buffer pointer never outlives its storage.
+  // The module may destroy this bridge during the encode callbacks, so these are members rather
+  // than call scoped locals and are never written after the module call returns.
+  Buffer::OwnedImpl request_buffer_;
+  Buffer::OwnedImpl response_buffer_;
 
   StreamInfo::BytesMeterSharedPtr bytes_meter_{std::make_shared<StreamInfo::BytesMeter>()};
 };

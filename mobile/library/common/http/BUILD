@@ -8,7 +8,6 @@ envoy_cc_library(
     name = "client_lib",
     srcs = ["client.cc"],
     hdrs = ["client.h"],
-    repository = "@envoy",
     deps = [
         ":header_utility_lib",
         "//library/common:engine_types_lib",
@@ -22,7 +21,6 @@ envoy_cc_library(
         "//library/common/stream_info:extra_stream_info_lib",
         "//library/common/system:system_helper_lib",
         "//library/common/types:c_types_lib",
-        "@abseil-cpp//absl/types:optional",
         "@envoy//envoy/buffer:buffer_interface",
         "@envoy//envoy/common:scope_tracker_interface",
         "@envoy//envoy/event:deferred_deletable",
@@ -51,7 +49,6 @@ envoy_cc_library(
     name = "header_utility_lib",
     srcs = ["header_utility.cc"],
     hdrs = ["header_utility.h"],
-    repository = "@envoy",
     deps = [
         "//library/common/bridge:utility_lib",
         "//library/common/types:c_types_lib",

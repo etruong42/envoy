@@ -4,16 +4,16 @@ build-image:
   repo: docker.io/envoyproxy/envoy-build
   repo-gcr: gcr.io/envoy-ci/envoy-build
   # default ci caching (ci)
-  sha: 20656853fae51927cda557e7af80ccff175f5de6f84bd0f092cd8672b2a6e0fe
-  sha-ci: 20656853fae51927cda557e7af80ccff175f5de6f84bd0f092cd8672b2a6e0fe
-  sha-devtools: 6e7a82d4f1ba040f4ebef0c1aae00cdbd205ff7a1284c20cc20984fdfa4a91d8
-  sha-docker: 85b6c3e76f093d9c9d10a968b5615cc8d82f38d7aef311100d542e4d640f5a74
-  sha-gcc: 439e870260c1599646d05b8b5d3bf1b6dd585c2e3cdac78dcb9f4081564c27fd
-  sha-mobile: bd1338a8951376211e4f4f6ff3171675670c4c582b0966f1d247abd3ba6a8a67
-  sha-worker: 25a68eff24b7414a346977d545687b87851d1c5746c466798050fa12fc5d0686
+  sha: 0fa203f090138434505a5f1269a8d2bb4a47b885facb4ef5e6dc0c9f861d2aba
+  sha-ci: 0fa203f090138434505a5f1269a8d2bb4a47b885facb4ef5e6dc0c9f861d2aba
+  sha-devtools: 7cbfd3c61439d510f5e21fcca6b08fcd6616b1d13ebd85d7550ecf4bfd8e3d23
+  sha-docker: b5fd90b42869e24c22110f4bd925ad30c30e8410d6cad2d5203ced628dd3dfdf
+  sha-gcc: 990d51067b5d2c23988a058a653605983216a6fe128feecd44d389e60a83b54e
+  sha-mobile: f5b988fc8b80be5c0e439981d681fe2a25afef147b397d5d8799a6eb0274cd67
+  sha-worker: 382f86d26825767ce9cf68dd168e23728863792af1b81f73afcb14a38a586016
   # TODO: remove this dupe (currently used by ci request handler)
-  mobile-sha: bd1338a8951376211e4f4f6ff3171675670c4c582b0966f1d247abd3ba6a8a67
-  tag: 86873047235e9b8232df989a5999b9bebf9db69c
+  mobile-sha: f5b988fc8b80be5c0e439981d681fe2a25afef147b397d5d8799a6eb0274cd67
+  tag: v0.2.3
 
 config:
   envoy:
@@ -35,6 +35,7 @@ checks:
     on-run:
     - check-build
     - check-build-openssl
+    - check-build-openssl-presubmit
     - check-coverage
     - check-runtime
     - check-san
@@ -89,11 +90,6 @@ checks:
     required: true
     on-run:
     - mobile-ios-tests
-  mobile-perf:
-    name: Mobile/Perf
-    required: true
-    on-run:
-    - mobile-perf
   mobile-python:
     name: Mobile/Python
     required: true
@@ -186,6 +182,20 @@ run:
   check-build-openssl:
     paths:
     - "**/*"
+  check-build-openssl-presubmit:
+    paths:
+    - compat/openssl/**/*
+    - source/common/tls/**/*
+    - source/common/crypto/**/*
+    - source/extensions/transport_sockets/tls/**/*
+    - test/common/tls/**/*
+    - test/common/crypto/**/*
+    - test/extensions/transport_sockets/tls/**/*
+    - envoy/ssl/**/*
+    - envoy/extensions/transport_sockets/tls/**/*
+    - bazel/**/*
+    - .bazelrc
+    - ci/do_ci.sh
   check-coverage:
     paths:
     - "**/*"
@@ -204,7 +214,6 @@ run:
     - .bazelversion
     - .github/config.yml
     - bazel/external/quiche.BUILD
-    - bazel/repository_locations.bzl
     - mobile/.bazelrc
     - mobile/**/*
     - source/common/**/*
@@ -215,7 +224,6 @@ run:
     - .bazelversion
     - .github/config.yml
     - bazel/external/quiche.BUILD
-    - bazel/repository_locations.bzl
     - mobile/.bazelrc
     - mobile/**/*
     - source/common/**/*
@@ -227,7 +235,6 @@ run:
     - .bazelversion
     - .github/config.yml
     - bazel/external/quiche.BUILD
-    - bazel/repository_locations.bzl
     - mobile/.bazelrc
     - mobile/**/*
     - tools/code_format/check_format.py
@@ -237,8 +244,6 @@ run:
     - .bazelversion
     - .github/config.yml
     - bazel/external/quiche.BUILD
-    - bazel/repositories.bzl
-    - bazel/repository_locations.bzl
     - mobile/.bazelrc
     - mobile/**/*
     - tools/code_format/check_format.py
@@ -249,8 +254,6 @@ run:
     - .github/config.yml
     - api/**/*
     - bazel/external/quiche.BUILD
-    - bazel/repositories.bzl
-    - bazel/repository_locations.bzl
     - envoy/**/*
     - mobile/.bazelrc
     - mobile/**/*
@@ -265,8 +268,6 @@ run:
     - .bazelversion
     - .github/config.yml
     - bazel/external/quiche.BUILD
-    - bazel/repositories.bzl
-    - bazel/repository_locations.bzl
     - mobile/.bazelrc
     - mobile/**/*
     - test/run_envoy_bazel_coverage.sh
@@ -278,7 +279,6 @@ run:
     - .bazelversion
     - .github/config.yml
     - bazel/external/quiche.BUILD
-    - bazel/repository_locations.bzl
     - mobile/.bazelrc
     - mobile/**/*
     - tools/code_format/check_format.py
@@ -288,7 +288,6 @@ run:
     - .bazelversion
     - .github/config.yml
     - bazel/external/quiche.BUILD
-    - bazel/repository_locations.bzl
     - mobile/.bazelrc
     - mobile/**/*
     - source/common/**/*
@@ -299,7 +298,6 @@ run:
     - .bazelversion
     - .github/config.yml
     - bazel/external/quiche.BUILD
-    - bazel/repository_locations.bzl
     - mobile/.bazelrc
     - mobile/**/*
     - source/common/**/*
@@ -311,7 +309,6 @@ run:
     - .bazelversion
     - .github/config.yml
     - bazel/external/quiche.BUILD
-    - bazel/repository_locations.bzl
     - mobile/.bazelrc
     - mobile/**/*
     - tools/code_format/check_format.py
@@ -321,7 +318,6 @@ run:
     - .bazelversion
     - .github/config.yml
     - bazel/external/quiche.BUILD
-    - bazel/repository_locations.bzl
     - mobile/.bazelrc
     - mobile/**/*
     - tools/code_format/check_format.py
@@ -332,8 +328,6 @@ run:
     - .github/config.yml
     - .github/workflows/mobile-python.yml
     - bazel/external/quiche.BUILD
-    - bazel/repositories.bzl
-    - bazel/repository_locations.bzl
     - mobile/.bazelrc
     - mobile/**/*
     - tools/code_format/check_format.py
@@ -343,7 +337,6 @@ run:
     - .bazelversion
     - .github/config.yml
     - bazel/external/quiche.BUILD
-    - bazel/repository_locations.bzl
     - mobile/.bazelrc
     - mobile/**/*
     - tools/code_format/check_format.py
@@ -353,8 +346,6 @@ run:
     - .bazelversion
     - .github/config.yml
     - bazel/external/quiche.BUILD
-    - bazel/repositories.bzl
-    - bazel/repository_locations.bzl
     - mobile/.bazelrc
     - mobile/**/*
     - tools/code_format/check_format.py
@@ -364,8 +355,14 @@ run:
     - .bazelversion
     - .github/config.yml
     - .github/dependabot.yml
+    - .github/workflows/_precheck_deps.yml
+    - ci/do_ci.sh
+    - VERSION.txt
     - bazel/BUILD
     - tools/dependency/*
+    - "**/.bazelrc"
+    - "**/MODULE.bazel"
+    - "**/MODULE.bazel.lock"
     - "**/*.bzl"
     - "**/requirements.txt"
     - "**/go.mod"

@@ -1,22 +1,33 @@
 #pragma once
 
+#include <cstdint>
+#include <functional>
+#include <memory>
+#include <string>
 #include <vector>
 
 #include "envoy/admin/v3/config_dump.pb.h"
+#include "envoy/common/pure.h"
 #include "envoy/config/core/v3/config_source.pb.h"
 #include "envoy/config/listener/v3/listener.pb.h"
 #include "envoy/config/listener/v3/listener_components.pb.h"
 #include "envoy/filter/config_provider_manager.h"
+#include "envoy/network/address.h"
+#include "envoy/network/connection_handler.h"
+#include "envoy/network/drain_decision.h"
 #include "envoy/network/filter.h"
-#include "envoy/network/listen_socket.h"
 #include "envoy/network/listener.h"
+#include "envoy/network/socket.h"
 #include "envoy/network/socket_interface.h"
 #include "envoy/server/api_listener.h"
 #include "envoy/server/drain_manager.h"
-#include "envoy/server/filter_config.h"
+#include "envoy/server/factory_context.h"
 #include "envoy/server/guarddog.h"
 
 #include "source/common/protobuf/protobuf.h"
+
+#include "absl/status/statusor.h"
+#include "absl/strings/string_view.h"
 
 namespace Envoy {
 namespace Filter {
@@ -276,6 +287,20 @@ public:
                              const Network::ExtraShutdownListenerOptions& options) PURE;
 
   /**
+   * Notify the connections of active listeners that a server-wide drain sequence has begun, so that
+   * connection-level drain logic (Network::Connection::onDrain()) can react. Only listeners whose
+   * traffic direction is covered by the drain direction are notified: an InboundOnly drain notifies
+   * only inbound listeners, while an All drain notifies every listener. Does not stop listeners or
+   * close connections.
+   * @param direction the direction of the server drain.
+   * @param drain_event the drain sequence to notify the connections of. The caller supplies it so
+   *        that every connection covered by one drain shares a single, consistent timeline, and so
+   *        that a caller which drains on terms of its own.
+   */
+  virtual void onServerDrainStart(Network::DrainDirection direction,
+                                  Network::ConnectionDrainEvent drain_event) PURE;
+
+  /**
    * Stop all threaded workers from running. When this routine returns all worker threads will
    * have exited.
    */
@@ -302,6 +327,12 @@ public:
    */
   virtual ApiListenerOptRef apiListener() PURE;
 
+  /**
+   * @return the server's API Listener by name if it exists, nullopt if it does
+   * not.
+   */
+  virtual ApiListenerOptRef apiListener(absl::string_view) { return apiListener(); }
+
   /*
    * @return TRUE if the worker has started or FALSE if not.
    */
@@ -323,6 +354,8 @@ public:
 // combination of flags, such as listeners(ListenerState::WARMING|ListenerState::ACTIVE)
 constexpr ListenerManager::ListenerState operator|(const ListenerManager::ListenerState lhs,
                                                    const ListenerManager::ListenerState rhs) {
+  // Bitmask combinations intentionally produce intermediate values that are not named enumerators.
+  // NOLINTNEXTLINE(clang-analyzer-optin.core.EnumCastOutOfRange)
   return static_cast<ListenerManager::ListenerState>(static_cast<uint8_t>(lhs) |
                                                      static_cast<uint8_t>(rhs));
 }

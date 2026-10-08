@@ -1,7 +1,11 @@
 #include "source/extensions/bootstrap/dynamic_modules/extension_config.h"
 
+#include <algorithm>
+#include <vector>
+
 #include "source/common/common/assert.h"
 
+#include "absl/container/flat_hash_set.h"
 #include "absl/strings/str_cat.h"
 
 namespace Envoy {
@@ -18,7 +22,7 @@ DynamicModuleBootstrapExtensionConfig::DynamicModuleBootstrapExtensionConfig(
     : dynamic_module_(std::move(dynamic_module)), main_thread_dispatcher_(main_thread_dispatcher),
       context_(context), stats_store_(stats_store),
       stats_scope_(stats_store.createScope(absl::StrCat(metrics_namespace, "."))),
-      stat_name_pool_(stats_scope_->symbolTable()) {
+      metrics_(*stats_scope_) {
   ASSERT(dynamic_module_ != nullptr);
   ASSERT(extension_name.data() != nullptr);
   ASSERT(extension_config.data() != nullptr);
@@ -52,6 +56,10 @@ bool DynamicModuleBootstrapExtensionConfig::enableClusterLifecycle() {
   if (cluster_lifecycle_enabled_) {
     return false;
   }
+  if (!server_initialized_) {
+    ENVOY_LOG(error, "cannot enable cluster lifecycle before server is initialized");
+    return false;
+  }
   cluster_lifecycle_enabled_ = true;
   cluster_update_callbacks_handle_ =
       context_.clusterManager().addThreadLocalClusterUpdateCallbacks(*this);
@@ -71,7 +79,7 @@ void DynamicModuleBootstrapExtensionConfig::onClusterAddOrUpdate(
   }
 }
 
-void DynamicModuleBootstrapExtensionConfig::onClusterRemoval(const std::string& cluster_name) {
+void DynamicModuleBootstrapExtensionConfig::onClusterRemoval(absl::string_view cluster_name) {
   if (in_module_config_ != nullptr && on_bootstrap_extension_cluster_removal_ != nullptr) {
     on_bootstrap_extension_cluster_removal_(thisAsVoidPtr(), in_module_config_,
                                             {cluster_name.data(), cluster_name.size()});
@@ -110,6 +118,90 @@ void DynamicModuleBootstrapExtensionConfig::onListenerRemoval(const std::string&
   }
 }
 
+void DynamicModuleBootstrapExtensionConfig::getActiveResourceNames(
+    envoy_dynamic_module_type_bootstrap_active_resource_kind kind,
+    absl::FunctionRef<void(absl::string_view)> emit) {
+  // The cluster manager and listener manager are not available until the server is initialized.
+  if (!server_initialized_) {
+    return;
+  }
+  // Each name is emitted at most once, e.g. an FCDS chain shared by several listeners.
+  absl::flat_hash_set<absl::string_view> seen;
+  auto emit_once = [&seen, &emit](absl::string_view name) {
+    if (seen.insert(name).second) {
+      emit(name);
+    }
+  };
+  switch (kind) {
+  case envoy_dynamic_module_type_bootstrap_active_resource_kind_FilterChain: {
+    // Filter chains across all active listeners. filterChainNames() returns the listener's inline
+    // and default chains plus, for an fcds_config listener, the FCDS chains its matcher references
+    // that are active. Reporting only via active listeners ties a reported name to being routable
+    // (an active listener's matcher dispatches to it) and active: a chain active in the
+    // process-wide FCDS manager but referenced only by a warming listener is not reported. An FCDS
+    // chain shared by several listeners is reported once.
+    if (listener_manager_ != nullptr) {
+      for (Network::ListenerConfig& listener :
+           listener_manager_->listeners(Server::ListenerManager::ListenerState::ACTIVE)) {
+        for (absl::string_view name : listener.filterChainManager().filterChainNames()) {
+          emit_once(name);
+        }
+      }
+    }
+    break;
+  }
+  case envoy_dynamic_module_type_bootstrap_active_resource_kind_Cluster:
+    for (const auto& cluster_entry : context_.clusterManager().clusters().active_clusters_) {
+      emit_once(cluster_entry.first);
+    }
+    break;
+  case envoy_dynamic_module_type_bootstrap_active_resource_kind_TransportSocketMatch: {
+    // A transport socket match is emitted only when present in every cluster that has matches, so a
+    // match is observed only once it has landed in all the clusters that carry per-endpoint
+    // matches. Clusters with no matches do not constrain the intersection.
+    std::vector<std::vector<absl::string_view>> per_cluster_matches;
+    for (const auto& [cluster_name, cluster] :
+         context_.clusterManager().clusters().active_clusters_) {
+      per_cluster_matches.push_back(cluster.get().info()->transportSocketMatcher().matchNames());
+    }
+    for (absl::string_view match_name : transportSocketMatchIntersection(per_cluster_matches)) {
+      emit_once(match_name);
+    }
+    break;
+  }
+  case envoy_dynamic_module_type_bootstrap_active_resource_kind_Secret:
+    for (absl::string_view secret_name : context_.secretManager().dynamicActiveSecretNames()) {
+      emit_once(secret_name);
+    }
+    break;
+  }
+}
+
+std::vector<absl::string_view>
+DynamicModuleBootstrapExtensionConfig::transportSocketMatchIntersection(
+    const std::vector<std::vector<absl::string_view>>& per_cluster_matches) {
+  std::vector<absl::string_view> result;
+  bool initialized = false;
+  for (const auto& cluster_matches : per_cluster_matches) {
+    // A cluster with no matches carries no per-endpoint matches, so it does not constrain the
+    // intersection.
+    if (cluster_matches.empty()) {
+      continue;
+    }
+    if (!initialized) {
+      result.assign(cluster_matches.begin(), cluster_matches.end());
+      initialized = true;
+      continue;
+    }
+    const absl::flat_hash_set<absl::string_view> names(cluster_matches.begin(),
+                                                       cluster_matches.end());
+    result.erase(std::remove_if(result.begin(), result.end(),
+                                [&names](absl::string_view n) { return !names.contains(n); }),
+                 result.end());
+  }
+  return result;
+}
+
 void DynamicModuleBootstrapExtensionConfig::onScheduled(uint64_t event_id) {
   if (in_module_config_ != nullptr && on_bootstrap_extension_config_scheduled_ != nullptr) {
     on_bootstrap_extension_config_scheduled_(thisAsVoidPtr(), in_module_config_, event_id);
@@ -121,6 +213,11 @@ DynamicModuleBootstrapExtensionConfig::sendHttpCallout(uint64_t* callout_id_out,
                                                        absl::string_view cluster_name,
                                                        Http::RequestMessagePtr&& message,
                                                        uint64_t timeout_milliseconds) {
+  // The cluster manager is not available during bootstrap extension creation, so accessing it
+  // before the server is initialized would dereference a null cluster manager in release builds.
+  if (!server_initialized_) {
+    return envoy_dynamic_module_type_http_callout_init_result_ClusterNotFound;
+  }
   // Access cluster manager lazily since it's not available during bootstrap extension creation.
   Upstream::ThreadLocalCluster* cluster =
       context_.clusterManager().getThreadLocalCluster(cluster_name);
@@ -377,6 +474,8 @@ newDynamicModuleBootstrapExtensionConfig(
   config->on_bootstrap_extension_cluster_removal_ = on_cluster_removal.value();
   config->on_bootstrap_extension_listener_add_or_update_ = on_listener_add_or_update.value();
   config->on_bootstrap_extension_listener_removal_ = on_listener_removal.value();
+
+  config->stat_creation_frozen_ = true;
 
   return config;
 }

@@ -28,14 +28,14 @@ class GenericSecretFormatterProvider : public Envoy::Formatter::FormatterProvide
 public:
   GenericSecretFormatterProvider(
       std::shared_ptr<Secret::ThreadLocalGenericSecretProvider> secret_provider,
-      absl::optional<size_t> max_length)
+      std::optional<size_t> max_length)
       : secret_provider_(std::move(secret_provider)), max_length_(max_length) {}
 
-  absl::optional<std::string> format(const Envoy::Formatter::Context&,
-                                     const StreamInfo::StreamInfo&) const override {
+  std::optional<std::string> format(const Envoy::Formatter::Context&,
+                                    const StreamInfo::StreamInfo&) const override {
     const std::string& value = secret_provider_->secret();
     if (value.empty()) {
-      return absl::nullopt;
+      return std::nullopt;
     }
     std::string result = value;
     Envoy::Formatter::SubstitutionFormatUtils::truncate(result, max_length_);
@@ -52,9 +52,29 @@ public:
     return val;
   }
 
+  bool formatTo(std::string& sink, const Envoy::Formatter::Context&,
+                const StreamInfo::StreamInfo&) const override {
+    absl::string_view value = secret_provider_->secret();
+    if (value.empty()) {
+      return false;
+    }
+    sink.append(Envoy::Formatter::SubstitutionFormatUtils::truncateStringView(value, max_length_));
+    return true;
+  }
+
+  void formatValueTo(Envoy::Formatter::ValueSink& sink, const Envoy::Formatter::Context&,
+                     const StreamInfo::StreamInfo&) const override {
+    absl::string_view value = secret_provider_->secret();
+    if (value.empty()) {
+      return;
+    }
+    sink.addString(
+        Envoy::Formatter::SubstitutionFormatUtils::truncateStringView(value, max_length_));
+  }
+
 private:
   std::shared_ptr<Secret::ThreadLocalGenericSecretProvider> secret_provider_;
-  const absl::optional<size_t> max_length_;
+  const std::optional<size_t> max_length_;
 };
 
 /**
@@ -68,9 +88,9 @@ public:
 
   explicit GenericSecretCommandParser(ProviderMap providers) : providers_(std::move(providers)) {}
 
-  Envoy::Formatter::FormatterProviderPtr parse(absl::string_view command,
-                                               absl::string_view subcommand,
-                                               absl::optional<size_t> max_length) const override {
+  absl::StatusOr<Envoy::Formatter::FormatterProviderPtr>
+  parse(absl::string_view command, absl::string_view subcommand,
+        std::optional<size_t> max_length) const override {
     if (command != SecretCommand) {
       return nullptr;
     }
@@ -107,7 +127,8 @@ Envoy::Formatter::CommandParserPtr GenericSecretFormatterFactory::createCommandP
     Secret::GenericSecretConfigProviderSharedPtr provider;
     if (secret_config.has_sds_config()) {
       provider = server_context.secretManager().findOrCreateGenericSecretProvider(
-          secret_config.sds_config(), secret_config.name(), server_context, context.initManager());
+          secret_config.sds_config(), secret_config.name(), server_context, context.initManager(),
+          true);
     } else {
       provider =
           server_context.secretManager().findStaticGenericSecretProvider(secret_config.name());
@@ -119,10 +140,11 @@ Envoy::Formatter::CommandParserPtr GenericSecretFormatterFactory::createCommandP
       }
     }
 
-    auto tls_provider = THROW_OR_RETURN_VALUE(
-        Secret::ThreadLocalGenericSecretProvider::create(
-            std::move(provider), server_context.threadLocal(), server_context.api()),
-        std::unique_ptr<Secret::ThreadLocalGenericSecretProvider>);
+    auto tls_provider =
+        THROW_OR_RETURN_VALUE(Secret::ThreadLocalGenericSecretProvider::create(
+                                  std::move(provider), server_context.threadLocal(),
+                                  server_context.api(), server_context.mainThreadDispatcher()),
+                              Secret::ThreadLocalGenericSecretProviderPtr);
 
     providers.emplace(
         name, std::shared_ptr<Secret::ThreadLocalGenericSecretProvider>(std::move(tls_provider)));

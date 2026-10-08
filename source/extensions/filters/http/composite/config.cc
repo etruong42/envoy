@@ -2,6 +2,7 @@
 
 #include "envoy/common/exception.h"
 #include "envoy/registry/registry.h"
+#include "envoy/server/filter_config.h"
 
 #include "source/common/config/utility.h"
 #include "source/extensions/filters/http/composite/filter.h"
@@ -63,7 +64,7 @@ CompositeFilterFactory::compileNamedFilterChains(
       ProtobufTypes::MessagePtr message = Config::Utility::translateAnyToFactoryConfig(
           filter_config.typed_config(), context.messageValidationVisitor(), factory);
       auto callback_or_status =
-          factory.createFilterFactoryFromProto(*message, stats_prefix, context);
+          Server::Configuration::createHttpFilterFactory(factory, *message, stats_prefix, context);
       if (!callback_or_status.status().ok()) {
         return absl::InvalidArgumentError(
             fmt::format("Failed to create filter factory for filter '{}' in named filter chain "
@@ -96,7 +97,7 @@ absl::StatusOr<Http::FilterFactoryCb> CompositeFilterFactory::createFilterFactor
         .is_downstream_ = true,
         .stat_prefix_ = stats_prefix,
         .factory_context_ = context,
-        .upstream_factory_context_ = absl::nullopt,
+        .upstream_factory_context_ = std::nullopt,
         .server_factory_context_ = context.serverFactoryContext()};
     auto match_tree_or_error = createMatcherTree(proto_config.matcher(), action_context);
     RETURN_IF_NOT_OK(match_tree_or_error.status());
@@ -127,7 +128,7 @@ absl::StatusOr<Envoy::Http::FilterFactoryCb> CompositeFilterFactory::createFilte
     Envoy::Http::Matching::HttpFilterActionContext action_context{
         .is_downstream_ = false,
         .stat_prefix_ = stats_prefix,
-        .factory_context_ = absl::nullopt,
+        .factory_context_ = std::nullopt,
         .upstream_factory_context_ = context,
         .server_factory_context_ = context.serverFactoryContext()};
 
@@ -159,8 +160,8 @@ CompositeFilterFactory::createRouteSpecificFilterConfigTyped(
       .is_downstream_ = true,
       .stat_prefix_ =
           fmt::format("http.{}.", context.scope().symbolTable().toString(context.scope().prefix())),
-      .factory_context_ = absl::nullopt,
-      .upstream_factory_context_ = absl::nullopt,
+      .factory_context_ = std::nullopt,
+      .upstream_factory_context_ = std::nullopt,
       .server_factory_context_ = context};
 
   auto match_tree_or_error = createMatcherTree(config.matcher(), action_context);
@@ -169,7 +170,7 @@ CompositeFilterFactory::createRouteSpecificFilterConfigTyped(
   if (match_tree == nullptr) {
     return nullptr;
   }
-  return std::make_shared<CompositePerRouteConfig>(match_tree);
+  return std::make_shared<CompositePerRouteConfig>(match_tree, context.mainThreadDispatcher());
 }
 
 /**

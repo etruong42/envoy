@@ -49,7 +49,7 @@ listener.
    */
   virtual void onAcceptWorker(Network::ConnectionSocketPtr&& socket,
                               bool hand_off_restored_destination_connections, bool rebalanced,
-                              const absl::optional<std::string>& network_namespace) PURE;
+                              const std::optional<std::string>& network_namespace) PURE;
 };
 
 /**
@@ -85,8 +85,7 @@ public:
 };
 
 using ConnectionBalancerSharedPtr = std::shared_ptr<ConnectionBalancer>;
-using BalancedConnectionHandlerOptRef =
-    absl::optional<std::reference_wrapper<BalancedConnectionHandler>>;
+using BalancedConnectionHandlerOptRef = OptRef<BalancedConnectionHandler>;
 
 } // namespace Network
 } // namespace Envoy

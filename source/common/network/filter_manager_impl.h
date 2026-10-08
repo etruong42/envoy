@@ -162,6 +162,9 @@ private:
       FixedReadBufferSource buffer_source{data, end_stream};
       parent_.onContinueReading(this, buffer_source);
     }
+    OptRef<Buffer::Instance> readBuffer() override {
+      return makeOptRef(parent_.connection_.getReadBuffer().buffer);
+    }
 
     void disableClose(bool disable) override;
 
@@ -219,7 +222,7 @@ private:
   std::list<ActiveReadFilterPtr> upstream_filters_;
   std::list<ActiveWriteFilterPtr> downstream_filters_;
   State state_;
-  absl::optional<ConnectionCloseAction> latched_close_action_;
+  std::optional<ConnectionCloseAction> latched_close_action_;
   AccessLog::InstanceSharedPtrVector access_logs_;
 };
 

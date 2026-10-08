@@ -1,10 +1,12 @@
+#include <memory>
+
 #include "source/common/stats/allocator_impl.h"
 #include "source/common/stats/symbol_table.h"
 #include "source/common/stats/tag_utility.h"
 #include "source/common/stats/thread_local_store.h"
 #include "source/extensions/access_loggers/stats/stats.h"
 
-#include "test/mocks/server/factory_context.h"
+#include "test/mocks/server/server_factory_context.h"
 #include "test/mocks/stream_info/mocks.h"
 #include "test/test_common/utility.h"
 
@@ -26,12 +28,17 @@ public:
   void addInflightGauge(Stats::StatName stat_name, Stats::StatNameTagVectorOptConstRef tags,
                         Stats::Gauge::ImportMode import_mode, uint64_t value,
                         std::vector<Stats::StatNameDynamicStorage> tags_storage) {
-    if (value == 0)
+    if (value == 0) {
       return;
+    }
 
-    Stats::TagUtility::TagStatNameJoiner joiner(Stats::StatName(), stat_name, tags,
-                                                logger_->scope().symbolTable());
-    Stats::StatName joined_name = joiner.nameWithTags();
+    // The joiner holds the joined bytes in its own footprint and is not movable, so it is
+    // allocated here: joined_name points into it and is used as the map key, which requires the
+    // bytes to keep a stable address once the joiner is owned by the map.
+    auto joiner = std::make_unique<Stats::TagUtility::TagStatNameJoiner>(
+        Stats::StatName(), stat_name, Stats::Scope::toTagSpan(tags),
+        logger_->scope().symbolTable());
+    Stats::StatName joined_name = joiner->nameWithTags();
     auto it = inflight_gauges_.find(joined_name);
     if (it == inflight_gauges_.end()) {
       auto [new_it, inserted] = inflight_gauges_.try_emplace(
@@ -44,10 +51,12 @@ public:
 
   void removeInflightGauge(Stats::StatName stat_name, Stats::StatNameTagVectorOptConstRef tags,
                            Stats::Gauge::ImportMode import_mode, uint64_t value) {
-    if (value == 0)
+    if (value == 0) {
       return;
+    }
 
-    Stats::TagUtility::TagStatNameJoiner joiner(Stats::StatName(), stat_name, tags,
+    Stats::TagUtility::TagStatNameJoiner joiner(Stats::StatName(), stat_name,
+                                                Stats::Scope::toTagSpan(tags),
                                                 logger_->scope().symbolTable());
     Stats::StatName joined_name = joiner.nameWithTags();
     auto it = inflight_gauges_.find(joined_name);
@@ -67,13 +76,14 @@ private:
   struct InflightGaugeNew {
     InflightGaugeNew(uint64_t value, Stats::Gauge::ImportMode import_mode,
                      std::vector<Stats::StatNameDynamicStorage> tags_storage,
-                     Stats::TagUtility::TagStatNameJoiner&& joiner)
+                     std::unique_ptr<Stats::TagUtility::TagStatNameJoiner> joiner)
         : value_(value), import_mode_(import_mode), tags_storage_(std::move(tags_storage)),
           joiner_(std::move(joiner)) {}
     uint64_t value_;
     Stats::Gauge::ImportMode import_mode_;
     std::vector<Stats::StatNameDynamicStorage> tags_storage_;
-    Stats::TagUtility::TagStatNameJoiner joiner_;
+    // Owns the bytes that this entry's map key points into; see addInflightGauge().
+    std::unique_ptr<Stats::TagUtility::TagStatNameJoiner> joiner_;
   };
   absl::node_hash_map<Stats::StatName, InflightGaugeNew> inflight_gauges_;
 };
@@ -152,24 +162,24 @@ static void runBenchmark(benchmark::State& state, SharedBencherSetup& setup, T& 
 }
 
 // --- Reality Benchmark ---
-static void BM_AccessLogState(benchmark::State& state) {
+static void bmAccessLogState(benchmark::State& state) {
   SharedBencherSetup setup;
   auto access_log_state = std::make_shared<AccessLogState>(setup.logger_);
   runBenchmark(state, setup, *access_log_state);
 }
-BENCHMARK(BM_AccessLogState)
+BENCHMARK(bmAccessLogState)
     ->Args({/*tag_count=*/3, /*length_selector=*/0})
     ->Args({/*tag_count=*/10, /*length_selector=*/0})
     ->Args({/*tag_count=*/3, /*length_selector=*/1})
     ->Args({/*tag_count=*/10, /*length_selector=*/1});
 
 // --- Joiner Benchmark ---
-static void BM_AccessLogStateUsingJoiner(benchmark::State& state) {
+static void bmAccessLogStateUsingJoiner(benchmark::State& state) {
   SharedBencherSetup setup;
   AccessLogStateUsingJoiner access_log_state(setup.logger_);
   runBenchmark(state, setup, access_log_state);
 }
-BENCHMARK(BM_AccessLogStateUsingJoiner)
+BENCHMARK(bmAccessLogStateUsingJoiner)
     ->Args({/*tag_count=*/3, /*length_selector=*/0})
     ->Args({/*tag_count=*/10, /*length_selector=*/0})
     ->Args({/*tag_count=*/3, /*length_selector=*/1})

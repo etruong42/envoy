@@ -12,6 +12,15 @@ namespace Extensions {
 namespace HttpFilters {
 namespace Composite {
 
+CompositePerRouteConfig::~CompositePerRouteConfig() {
+  if (match_tree_ == nullptr || main_dispatcher_.isThreadSafe()) {
+    return;
+  }
+  // A route configuration may be released on a worker thread when an RDS update replaces it, but
+  // the match tree must be destroyed on the main thread.
+  main_dispatcher_.post([match_tree = std::move(match_tree_)]() mutable { match_tree.reset(); });
+}
+
 namespace {
 // Helper that returns `filter->func(args...)` if the filter is not null, returning `rval`
 // otherwise.
@@ -288,7 +297,6 @@ void Filter::updateFilterState(Http::StreamFilterCallbacks* callback,
   } else {
     callback->streamInfo().filterState()->setData(
         MatchedActionsFilterStateKey, std::make_shared<MatchedActionInfo>(filter_name, action_name),
-        StreamInfo::FilterState::StateType::Mutable,
         StreamInfo::FilterState::LifeSpan::FilterChain);
   }
 }

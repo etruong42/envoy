@@ -19,6 +19,7 @@ envoy_cc_test(
     deps = [
         "//source/common/stats:custom_stat_namespaces_lib",
         "//source/extensions/tracers/dynamic_modules:config",
+        "//test/extensions/dynamic_modules:util",
         "//test/mocks/server:tracer_factory_context_mocks",
         "//test/test_common:environment_lib",
         "//test/test_common:test_runtime_lib",
@@ -34,6 +35,7 @@ envoy_cc_test(
         "//test/extensions/dynamic_modules/test_data/c:no_op",
         "//test/extensions/dynamic_modules/test_data/c:tracer_config_fail",
         "//test/extensions/dynamic_modules/test_data/c:tracer_no_op",
+        "//test/extensions/dynamic_modules/test_data/c:tracer_no_op_no_reserve_tags",
         "//test/extensions/dynamic_modules/test_data/c:tracer_with_values",
     ],
     deps = [
@@ -41,6 +43,7 @@ envoy_cc_test(
         "//test/mocks/stream_info:stream_info_mocks",
         "//test/mocks/tracing:tracing_mocks",
         "//test/test_common:environment_lib",
+        "//test/test_common:status_utility_lib",
         "//test/test_common:utility_lib",
     ],
 )
@@ -57,6 +60,7 @@ envoy_cc_test(
         "//test/mocks/stream_info:stream_info_mocks",
         "//test/mocks/tracing:tracing_mocks",
         "//test/test_common:environment_lib",
+        "//test/test_common:status_utility_lib",
         "//test/test_common:utility_lib",
     ],
 )

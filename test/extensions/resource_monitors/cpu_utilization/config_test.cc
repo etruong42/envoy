@@ -1,3 +1,5 @@
+#include <optional>
+
 #include "envoy/extensions/resource_monitors/cpu_utilization/v3/cpu_utilization.pb.h"
 #include "envoy/registry/registry.h"
 
@@ -7,9 +9,9 @@
 #include "source/server/resource_monitor_config_impl.h"
 
 #include "test/mocks/event/mocks.h"
+#include "test/mocks/runtime/mocks.h"
 #include "test/mocks/server/options.h"
 
-#include "absl/types/optional.h"
 #include "gtest/gtest.h"
 
 namespace Envoy {
@@ -25,7 +27,7 @@ public:
     has_success_ = true;
   }
 
-  void onFailure(const EnvoyException& error) override {
+  void onFailure(const absl::Status& error) override {
     error_ = error;
     has_error_ = true;
   }
@@ -35,8 +37,8 @@ public:
   double pressure() const { return pressure_.value_or(0.0); }
 
 private:
-  absl::optional<double> pressure_;
-  absl::optional<EnvoyException> error_;
+  std::optional<double> pressure_;
+  std::optional<absl::Status> error_;
   bool has_success_ = false;
   bool has_error_ = false;
 };
@@ -53,10 +55,12 @@ TEST(CpuUtilizationMonitorFactoryTest, CreateMonitorDefault) {
   Event::MockDispatcher dispatcher;
   Api::ApiPtr api = Api::createApiForTest();
   Server::MockOptions options;
+  testing::NiceMock<Runtime::MockLoader> runtime;
   Server::Configuration::ResourceMonitorFactoryContextImpl context(
-      dispatcher, options, *api, ProtobufMessage::getStrictValidationVisitor());
-  auto monitor = factory->createResourceMonitor(config, context);
-  EXPECT_NE(monitor, nullptr);
+      dispatcher, options, *api, ProtobufMessage::getStrictValidationVisitor(), runtime);
+  auto monitor_or_error = factory->createResourceMonitor(config, context);
+  EXPECT_TRUE(monitor_or_error.ok());
+  EXPECT_NE(monitor_or_error.value(), nullptr);
 }
 
 TEST(CpuUtilizationMonitorFactoryTest, CreateContainerCPUMonitor) {
@@ -74,24 +78,20 @@ TEST(CpuUtilizationMonitorFactoryTest, CreateContainerCPUMonitor) {
   Event::MockDispatcher dispatcher;
   Api::ApiPtr api = Api::createApiForTest();
   Server::MockOptions options;
+  testing::NiceMock<Runtime::MockLoader> runtime;
   Server::Configuration::ResourceMonitorFactoryContextImpl context(
-      dispatcher, options, *api, ProtobufMessage::getStrictValidationVisitor());
+      dispatcher, options, *api, ProtobufMessage::getStrictValidationVisitor(), runtime);
 
+  auto monitor_or_error = factory->createResourceMonitor(config, context);
 #if defined(__linux__)
-  // Skip the check if the system running the test does not support cgroup.
-  TRY_ASSERT_MAIN_THREAD {
-    auto monitor = factory->createResourceMonitor(config, context);
-    // If we did not throw, we must have a non-null monitor.
-    EXPECT_NE(monitor, nullptr);
-  }
-  END_TRY
-  CATCH(EnvoyException & e, {
-    // If we did throw it must have been because of cgroup.
-    ASSERT_THAT(std::string(e.what()), ::testing::Eq(NoSupportedCGroupMessage));
+  if (!monitor_or_error.ok()) {
+    ASSERT_THAT(std::string(monitor_or_error.status().message()),
+                ::testing::Eq(NoSupportedCGroupMessage));
     GTEST_SKIP() << "Skipping test because the current machine does not support cgroup";
-  });
+  }
+  EXPECT_NE(monitor_or_error.value(), nullptr);
 #else
-  EXPECT_THROW(factory->createResourceMonitor(config, context), EnvoyException);
+  EXPECT_FALSE(monitor_or_error.ok());
 #endif
 }
 
@@ -105,15 +105,16 @@ TEST(CpuUtilizationMonitorFactoryTest, HostMonitorFunctional) {
   Event::MockDispatcher dispatcher;
   Api::ApiPtr api = Api::createApiForTest();
   Server::MockOptions options;
+  testing::NiceMock<Runtime::MockLoader> runtime;
   Server::Configuration::ResourceMonitorFactoryContextImpl context(
-      dispatcher, options, *api, ProtobufMessage::getStrictValidationVisitor());
-  auto monitor = factory->createResourceMonitor(config, context);
+      dispatcher, options, *api, ProtobufMessage::getStrictValidationVisitor(), runtime);
+  auto monitor_or_error = factory->createResourceMonitor(config, context);
+  ASSERT_TRUE(monitor_or_error.ok());
+  auto monitor = std::move(monitor_or_error.value());
   ASSERT_NE(monitor, nullptr);
 
-  // Exercise the monitor by calling updateResourceUsage
   TestResourcePressureCallbacks callbacks;
   monitor->updateResourceUsage(callbacks);
-  // Either success or error is acceptable depending on system state
   EXPECT_TRUE(callbacks.hasSuccess() || callbacks.hasError());
 }
 
@@ -130,27 +131,22 @@ TEST(CpuUtilizationMonitorFactoryTest, ContainerMonitorFunctional) {
   Event::MockDispatcher dispatcher;
   Api::ApiPtr api = Api::createApiForTest();
   Server::MockOptions options;
+  testing::NiceMock<Runtime::MockLoader> runtime;
   Server::Configuration::ResourceMonitorFactoryContextImpl context(
-      dispatcher, options, *api, ProtobufMessage::getStrictValidationVisitor());
+      dispatcher, options, *api, ProtobufMessage::getStrictValidationVisitor(), runtime);
 
-  // Skip the check if the system running the test does not support cgroup.
-  TRY_ASSERT_MAIN_THREAD {
-    auto monitor = factory->createResourceMonitor(config, context);
-    // If cgroup files exist (Linux CI), monitor should be created and functional
-    ASSERT_NE(monitor, nullptr);
-
-    // Exercise the monitor by calling updateResourceUsage
-    TestResourcePressureCallbacks callbacks;
-    monitor->updateResourceUsage(callbacks);
-    // Either success or error is acceptable depending on system state
-    EXPECT_TRUE(callbacks.hasSuccess() || callbacks.hasError());
-  }
-  END_TRY
-  CATCH(EnvoyException & e, {
-    // If we did throw it must have been because of cgroup.
-    ASSERT_THAT(std::string(e.what()), ::testing::Eq(NoSupportedCGroupMessage));
+  auto monitor_or_error = factory->createResourceMonitor(config, context);
+  if (!monitor_or_error.ok()) {
+    ASSERT_THAT(std::string(monitor_or_error.status().message()),
+                ::testing::Eq(NoSupportedCGroupMessage));
     GTEST_SKIP() << "Skipping test because the current machine does not support cgroup";
-  });
+  }
+  auto monitor = std::move(monitor_or_error.value());
+  ASSERT_NE(monitor, nullptr);
+
+  TestResourcePressureCallbacks callbacks;
+  monitor->updateResourceUsage(callbacks);
+  EXPECT_TRUE(callbacks.hasSuccess() || callbacks.hasError());
 }
 #endif
 

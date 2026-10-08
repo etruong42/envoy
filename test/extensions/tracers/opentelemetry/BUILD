@@ -21,8 +21,11 @@ envoy_extension_cc_test(
         # https://github.com/open-telemetry/opentelemetry-cpp/blob/v1.14.0/api/BUILD#L32
         "-DHAVE_ABSEIL",
     ],
-    extension_names = ["envoy.tracers.opentelemetry"],
-    rbe_pool = "6gig",
+    extension_names = [
+        "envoy.tracers.opentelemetry",
+        "envoy.tracers.opentelemetry.samplers.always_on",
+    ],
+    rbe_pool = "linux_x64_small",
     deps = [
         "//envoy/common:time_interface",
         "//envoy/runtime:runtime_interface",
@@ -33,6 +36,7 @@ envoy_extension_cc_test(
         "//source/common/protobuf:utility_lib",
         "//source/common/runtime:runtime_lib",
         "//source/extensions/tracers/opentelemetry:opentelemetry_tracer_lib",
+        "//source/extensions/tracers/opentelemetry/samplers/always_on:config",
         "//test/mocks:common_lib",
         "//test/mocks/http:http_mocks",
         "//test/mocks/server:tracer_factory_context_mocks",
@@ -43,7 +47,6 @@ envoy_extension_cc_test(
         "//test/mocks/upstream:thread_local_cluster_mocks",
         "//test/test_common:simulated_time_system_lib",
         "//test/test_common:utility_lib",
-        "@abseil-cpp//absl/types:optional",
         "@opentelemetry-cpp//api",
     ],
 )
@@ -52,9 +55,10 @@ envoy_extension_cc_test(
     name = "config_test",
     srcs = ["config_test.cc"],
     extension_names = ["envoy.tracers.opentelemetry"],
-    rbe_pool = "6gig",
+    rbe_pool = "linux_x64_small",
     deps = [
         "//source/extensions/tracers/opentelemetry:config",
+        "//source/extensions/tracers/opentelemetry:trace_exporter",
         "//test/mocks/server:tracer_factory_context_mocks",
         "//test/mocks/server:tracer_factory_mocks",
         "//test/test_common:utility_lib",
@@ -66,7 +70,7 @@ envoy_extension_cc_test(
     name = "span_context_extractor_test",
     srcs = ["span_context_extractor_test.cc"],
     extension_names = ["envoy.tracers.opentelemetry"],
-    rbe_pool = "6gig",
+    rbe_pool = "linux_x64_small",
     deps = [
         "//source/extensions/tracers/opentelemetry:opentelemetry_tracer_lib",
         "//test/test_common:status_utility_lib",
@@ -78,12 +82,12 @@ envoy_extension_cc_test(
     name = "grpc_trace_exporter_test",
     srcs = ["grpc_trace_exporter_test.cc"],
     extension_names = ["envoy.tracers.opentelemetry"],
-    rbe_pool = "6gig",
+    rbe_pool = "linux_x64_small",
     deps = [
         "//source/extensions/tracers/opentelemetry:trace_exporter",
         "//test/mocks/grpc:grpc_mocks",
         "//test/mocks/http:http_mocks",
-        "//test/test_common:utility_lib",
+        "//test/test_common:logging_lib",
     ],
 )
 
@@ -91,7 +95,7 @@ envoy_extension_cc_test(
     name = "http_trace_exporter_test",
     srcs = ["http_trace_exporter_test.cc"],
     extension_names = ["envoy.tracers.opentelemetry"],
-    rbe_pool = "6gig",
+    rbe_pool = "linux_x64_small",
     deps = [
         "//source/extensions/formatter/file_content:config",
         "//source/extensions/tracers/opentelemetry:trace_exporter",
@@ -108,7 +112,7 @@ envoy_extension_cc_test(
     name = "operation_name_test",
     srcs = ["operation_name_test.cc"],
     extension_names = ["envoy.tracers.opentelemetry"],
-    rbe_pool = "6gig",
+    rbe_pool = "linux_x64_small",
     deps = [
         "//source/extensions/tracers/opentelemetry:config",
         "//source/extensions/tracers/opentelemetry:opentelemetry_tracer_lib",
@@ -124,7 +128,7 @@ envoy_extension_cc_test(
     name = "grpc_trace_exporter_integration_test",
     srcs = ["grpc_trace_exporter_integration_test.cc"],
     extension_names = ["envoy.tracers.opentelemetry"],
-    rbe_pool = "6gig",
+    rbe_pool = "linux_x64_small",
     deps = [
         "//source/extensions/tracers/opentelemetry:config",
         "//source/extensions/tracers/opentelemetry:opentelemetry_tracer_lib",
@@ -142,7 +146,7 @@ envoy_extension_cc_test(
     name = "http_trace_exporter_integration_test",
     srcs = ["http_trace_exporter_integration_test.cc"],
     extension_names = ["envoy.tracers.opentelemetry"],
-    rbe_pool = "6gig",
+    rbe_pool = "linux_x64_small",
     deps = [
         "//source/extensions/tracers/opentelemetry:config",
         "//source/extensions/tracers/opentelemetry:opentelemetry_tracer_lib",

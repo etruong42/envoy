@@ -51,6 +51,12 @@ crate-type = ["cdylib"]
 test = true
 
 [[example]]
+name = "listener_no_op"
+path = "listener_no_op.rs"
+crate-type = ["cdylib"]
+test = true
+
+[[example]]
 name = "bootstrap_function_registry_test"
 path = "bootstrap_function_registry_test.rs"
 crate-type = ["cdylib"]
@@ -65,6 +71,12 @@ test = true
 [[example]]
 name = "bootstrap_timer_test"
 path = "bootstrap_timer_test.rs"
+crate-type = ["cdylib"]
+test = true
+
+[[example]]
+name = "bootstrap_signed_callout_test"
+path = "bootstrap_signed_callout_test.rs"
 crate-type = ["cdylib"]
 test = true
 

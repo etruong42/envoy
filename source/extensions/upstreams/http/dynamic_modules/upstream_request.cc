@@ -145,6 +145,9 @@ HttpTcpBridge::HttpTcpBridge(Router::UpstreamToDownstream* upstream_request,
 }
 
 HttpTcpBridge::~HttpTcpBridge() {
+  // A terminal response is deferred until after the hook returns, so the bridge is never destroyed
+  // while a module hook still holds a borrow to it.
+  ASSERT(!in_module_hook_);
   if (in_module_bridge_ != nullptr) {
     (*config_->on_bridge_destroy_)(in_module_bridge_);
     in_module_bridge_ = nullptr;
@@ -160,8 +163,11 @@ Envoy::Http::Status HttpTcpBridge::encodeHeaders(const Envoy::Http::RequestHeade
   request_headers_ = &headers;
   downstream_complete_ = end_stream;
 
+  in_module_hook_ = true;
   (*config_->on_bridge_encode_headers_)(static_cast<void*>(this), in_module_bridge_, end_stream);
+  in_module_hook_ = false;
 
+  applyPendingResponse();
   return Envoy::Http::okStatus();
 }
 
@@ -171,17 +177,20 @@ void HttpTcpBridge::encodeData(Buffer::Instance& data, bool end_stream) {
   }
   downstream_complete_ = end_stream;
 
-  // Move into a local buffer so the module reads from a stable copy. The module is expected
-  // to forward the data via send_upstream_data, which writes to the connection and drains
+  // Move into the owned request buffer so the module reads from a stable copy whose lifetime is
+  // tied to this object. Draining first scopes the buffer to the current call. The module is
+  // expected to forward the data via send_upstream_data, which writes to the connection and drains
   // naturally.
-  Buffer::OwnedImpl local_buffer;
-  local_buffer.move(data);
-  request_buffer_ = &local_buffer;
+  request_buffer_.drain(request_buffer_.length());
+  request_buffer_.move(data);
 
-  // The module callback may trigger decodeData with end_stream=true (e.g., via sendResponse),
-  // which can cause the router to destroy this object. Do not access any member variables after
-  // this call.
+  in_module_hook_ = true;
   (*config_->on_bridge_encode_data_)(static_cast<void*>(this), in_module_bridge_, end_stream);
+  in_module_hook_ = false;
+
+  // A terminal response requested by the module is applied here, which may destroy this object. Do
+  // not access any member variables after this call.
+  applyPendingResponse();
 }
 
 void HttpTcpBridge::encodeTrailers(const Envoy::Http::RequestTrailerMap&) {
@@ -190,7 +199,11 @@ void HttpTcpBridge::encodeTrailers(const Envoy::Http::RequestTrailerMap&) {
   }
   downstream_complete_ = true;
 
+  in_module_hook_ = true;
   (*config_->on_bridge_encode_trailers_)(static_cast<void*>(this), in_module_bridge_);
+  in_module_hook_ = false;
+
+  applyPendingResponse();
 }
 
 void HttpTcpBridge::readDisable(bool disable) {
@@ -211,20 +224,22 @@ void HttpTcpBridge::onUpstreamData(Buffer::Instance& data, bool end_stream) {
     return;
   }
 
-  // Move data into a local buffer before calling the module. The module callback may trigger
-  // downstream processing that re-enables upstream reads, causing a re-entrant onUpstreamData
-  // call. Moving the data first ensures the connection's read buffer is empty, preventing the
-  // same data from being delivered twice.
-  Buffer::OwnedImpl local_buffer;
-  local_buffer.move(data);
+  // Move data into the owned response buffer before calling the module. The module callback may
+  // trigger downstream processing that re-enables upstream reads, causing a re-entrant
+  // onUpstreamData call. Moving the data first ensures the connection's read buffer is empty,
+  // preventing the same data from being delivered twice. The owned buffer is tied to this object so
+  // the pointer never outlives its storage. Draining first scopes the buffer to the current call.
+  response_buffer_.drain(response_buffer_.length());
+  response_buffer_.move(data);
+  bytes_meter_->addWireBytesReceived(response_buffer_.length());
 
-  response_buffer_ = &local_buffer;
-  bytes_meter_->addWireBytesReceived(local_buffer.length());
-
-  // The module callback may trigger decodeData with end_stream=true, which can cause the router
-  // to call resetStream() and ultimately destroy this object. Do not access any member variables
-  // after this call.
+  in_module_hook_ = true;
   (*config_->on_bridge_on_upstream_data_)(static_cast<void*>(this), in_module_bridge_, end_stream);
+  in_module_hook_ = false;
+
+  // A terminal response requested by the module is applied here, which may destroy this object. Do
+  // not access any member variables after this call.
+  applyPendingResponse();
 }
 
 void HttpTcpBridge::onEvent(Network::ConnectionEvent event) {
@@ -289,6 +304,14 @@ void HttpTcpBridge::sendResponse(uint32_t status_code,
     return;
   }
   auto headers = buildResponseHeaders(status_code, headers_vector, headers_vector_size);
+  // A complete response ends the stream. Defer it when a hook is on the stack so the reset it
+  // triggers cannot destroy this bridge under a live module borrow.
+  if (in_module_hook_) {
+    pending_response_ = PendingResponse::Response;
+    pending_headers_ = std::move(headers);
+    pending_body_.assign(body.data(), body.size());
+    return;
+  }
   if (!body.empty()) {
     upstream_request_->decodeHeaders(std::move(headers), false);
     Buffer::OwnedImpl body_buffer(body);
@@ -305,11 +328,21 @@ void HttpTcpBridge::sendResponseHeaders(
     return;
   }
   auto headers = buildResponseHeaders(status_code, headers_vector, headers_vector_size);
+  if (in_module_hook_ && end_stream) {
+    pending_response_ = PendingResponse::Headers;
+    pending_headers_ = std::move(headers);
+    return;
+  }
   upstream_request_->decodeHeaders(std::move(headers), end_stream);
 }
 
 void HttpTcpBridge::sendResponseData(absl::string_view data, bool end_stream) {
   if (upstream_request_ == nullptr) {
+    return;
+  }
+  if (in_module_hook_ && end_stream) {
+    pending_response_ = PendingResponse::Data;
+    pending_body_.assign(data.data(), data.size());
     return;
   }
   Buffer::OwnedImpl buffer(data);
@@ -331,7 +364,47 @@ void HttpTcpBridge::sendResponseTrailers(
       trailers->addCopy(Envoy::Http::LowerCaseString(key), value);
     }
   }
+  if (in_module_hook_) {
+    pending_response_ = PendingResponse::Trailers;
+    pending_trailers_ = std::move(trailers);
+    return;
+  }
   upstream_request_->decodeTrailers(std::move(trailers));
+}
+
+void HttpTcpBridge::applyPendingResponse() {
+  if (pending_response_ == PendingResponse::None || upstream_request_ == nullptr) {
+    return;
+  }
+  const PendingResponse kind = pending_response_;
+  pending_response_ = PendingResponse::None;
+  // Move the captured response into locals and capture the downstream handle, because applying a
+  // terminal response may reset the stream and destroy this bridge.
+  Router::UpstreamToDownstream* upstream_request = upstream_request_;
+  Envoy::Http::ResponseHeaderMapPtr headers = std::move(pending_headers_);
+  Envoy::Http::ResponseTrailerMapPtr trailers = std::move(pending_trailers_);
+  Buffer::OwnedImpl body_buffer(pending_body_);
+  switch (kind) {
+  case PendingResponse::Response:
+    if (!pending_body_.empty()) {
+      upstream_request->decodeHeaders(std::move(headers), false);
+      upstream_request->decodeData(body_buffer, true);
+    } else {
+      upstream_request->decodeHeaders(std::move(headers), true);
+    }
+    break;
+  case PendingResponse::Headers:
+    upstream_request->decodeHeaders(std::move(headers), true);
+    break;
+  case PendingResponse::Data:
+    upstream_request->decodeData(body_buffer, true);
+    break;
+  case PendingResponse::Trailers:
+    upstream_request->decodeTrailers(std::move(trailers));
+    break;
+  case PendingResponse::None:
+    break;
+  }
 }
 
 } // namespace DynamicModules

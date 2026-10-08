@@ -22,6 +22,7 @@
 #include "source/common/grpc/typed_async_client.h"
 #include "source/common/http/codes.h"
 #include "source/common/http/header_map_impl.h"
+#include "source/common/protobuf/arena_wrapped_proto.h"
 #include "source/common/runtime/runtime_protos.h"
 #include "source/extensions/filters/common/ext_authz/check_request_utils.h"
 #include "source/extensions/filters/common/ext_authz/ext_authz.h"
@@ -29,6 +30,8 @@
 #include "source/extensions/filters/common/ext_authz/ext_authz_http_impl.h"
 #include "source/extensions/filters/common/mutation_rules/mutation_rules.h"
 #include "source/extensions/filters/common/processing_effect/processing_effect.h"
+
+#include "absl/container/flat_hash_set.h"
 
 namespace Envoy {
 namespace Extensions {
@@ -83,7 +86,7 @@ public:
 
   ProtobufTypes::MessagePtr serializeAsProto() const override;
 
-  absl::optional<std::string> serializeAsString() const override;
+  std::optional<std::string> serializeAsString() const override;
 
   // Expose check_result and status_code as individual fields so access-log formatters
   // and CEL expressions can read them without paying the cost of serializing the full
@@ -110,17 +113,17 @@ private:
 
 class ExtAuthzLoggingInfo : public Envoy::StreamInfo::FilterState::Object {
 public:
-  explicit ExtAuthzLoggingInfo(const absl::optional<Envoy::Protobuf::Struct> filter_metadata)
+  explicit ExtAuthzLoggingInfo(const std::optional<Envoy::Protobuf::Struct> filter_metadata)
       : filter_metadata_(filter_metadata) {}
 
-  const absl::optional<Protobuf::Struct>& filterMetadata() const { return filter_metadata_; }
-  absl::optional<std::chrono::microseconds> latency() const { return latency_; };
-  absl::optional<uint64_t> bytesSent() const { return bytes_sent_; }
-  absl::optional<uint64_t> bytesReceived() const { return bytes_received_; }
+  const std::optional<Protobuf::Struct>& filterMetadata() const { return filter_metadata_; }
+  std::optional<std::chrono::microseconds> latency() const { return latency_; };
+  std::optional<uint64_t> bytesSent() const { return bytes_sent_; }
+  std::optional<uint64_t> bytesReceived() const { return bytes_received_; }
   Upstream::ClusterInfoConstSharedPtr clusterInfo() const { return cluster_info_; }
   Upstream::HostDescriptionConstSharedPtr upstreamHost() const { return upstream_host_; }
   // Gets the gRPC status returned by the authorization server when it is making a gRPC call.
-  const absl::optional<Grpc::Status::GrpcStatus>& grpcStatus() const { return grpc_status_; }
+  const std::optional<Grpc::Status::GrpcStatus>& grpcStatus() const { return grpc_status_; }
   // Returns true if the ext_authz stream failed open.
   bool failedOpen() const { return failed_open_; }
   const Filters::Common::ProcessingEffect::Effect& requestProcessingEffect() const {
@@ -157,24 +160,24 @@ public:
   }
 
   // For convenience in testing.
-  void clearLatency() { latency_ = absl::nullopt; };
-  void clearBytesSent() { bytes_sent_ = absl::nullopt; }
-  void clearBytesReceived() { bytes_received_ = absl::nullopt; }
+  void clearLatency() { latency_ = std::nullopt; };
+  void clearBytesSent() { bytes_sent_ = std::nullopt; }
+  void clearBytesReceived() { bytes_received_ = std::nullopt; }
   void clearClusterInfo() { cluster_info_ = nullptr; }
   void clearUpstreamHost() { upstream_host_ = nullptr; }
 
 private:
-  const absl::optional<Envoy::Protobuf::Struct> filter_metadata_;
-  absl::optional<std::chrono::microseconds> latency_;
+  const std::optional<Envoy::Protobuf::Struct> filter_metadata_;
+  std::optional<std::chrono::microseconds> latency_;
   // The last processing effect applied to the request by the ext_authz filter.
   Filters::Common::ProcessingEffect::Effect last_req_processing_effect_{};
   // The following stats are populated for ext_authz filters using Envoy gRPC only.
-  absl::optional<uint64_t> bytes_sent_;
-  absl::optional<uint64_t> bytes_received_;
+  std::optional<uint64_t> bytes_sent_;
+  std::optional<uint64_t> bytes_received_;
   Upstream::ClusterInfoConstSharedPtr cluster_info_;
   Upstream::HostDescriptionConstSharedPtr upstream_host_;
   // The gRPC status returned by the authorization server when it is making a gRPC call.
-  absl::optional<Grpc::Status::GrpcStatus> grpc_status_;
+  std::optional<Grpc::Status::GrpcStatus> grpc_status_;
   // True if the call failed open.
   bool failed_open_{false};
 };
@@ -188,7 +191,8 @@ class FilterConfig {
 public:
   FilterConfig(const envoy::extensions::filters::http::ext_authz::v3::ExtAuthz& config,
                Stats::Scope& scope, const std::string& stats_prefix,
-               Server::Configuration::ServerFactoryContext& factory_context);
+               Server::Configuration::ServerFactoryContext& factory_context,
+               absl::Status& creation_status);
 
   bool allowPartialMessage() const { return allow_partial_message_; }
 
@@ -201,6 +205,10 @@ public:
   bool failureModeAllowHeaderAdd() const { return failure_mode_allow_header_add_; }
 
   bool clearRouteCache() const { return clear_route_cache_; }
+
+  const absl::flat_hash_set<std::string>& clearRouteCacheHeaders() const {
+    return clear_route_cache_headers_;
+  }
 
   uint32_t maxRequestBytes() const { return max_request_bytes_; }
 
@@ -271,7 +279,7 @@ public:
   bool includeTLSSession() const { return include_tls_session_; }
   const LabelsMap& destinationLabels() const { return destination_labels_; }
 
-  const absl::optional<Protobuf::Struct>& filterMetadata() const { return filter_metadata_; }
+  const std::optional<Protobuf::Struct>& filterMetadata() const { return filter_metadata_; }
 
   bool emitFilterStateStats() const { return emit_filter_state_stats_; }
 
@@ -286,6 +294,8 @@ public:
   const Filters::Common::ExtAuthz::MatcherSharedPtr& disallowedHeadersMatcher() const {
     return disallowed_headers_matcher_;
   }
+
+  bool emitClientSpan() const { return emit_client_span_; }
 
 private:
   static Http::Code toErrorCode(uint64_t status) {
@@ -317,6 +327,9 @@ private:
   const bool failure_mode_allow_header_add_;
   const bool shadow_mode_;
   const bool clear_route_cache_;
+  // Lower cased request header names the routes match on. Empty means clear the route cache on any
+  // request mutation.
+  const absl::flat_hash_set<std::string> clear_route_cache_headers_;
   const uint32_t max_request_bytes_;
   const uint32_t max_denied_response_body_bytes_;
   const bool pack_as_bytes_;
@@ -324,18 +337,18 @@ private:
   const Http::Code status_on_error_;
   const bool validate_mutations_;
   Stats::Scope& scope_;
-  const absl::optional<Filters::Common::MutationRules::Checker> decoder_header_mutation_checker_;
+  const std::optional<Filters::Common::MutationRules::Checker> decoder_header_mutation_checker_;
   const bool enable_dynamic_metadata_ingestion_;
   Runtime::Loader& runtime_;
   Http::Context& http_context_;
   LabelsMap destination_labels_;
-  const absl::optional<Protobuf::Struct> filter_metadata_;
+  const std::optional<Protobuf::Struct> filter_metadata_;
   const bool emit_filter_state_stats_;
   const bool enforce_response_header_limits_;
 
-  const absl::optional<Runtime::FractionalPercent> filter_enabled_;
-  const absl::optional<Matchers::MetadataMatcher> filter_enabled_metadata_;
-  const absl::optional<Runtime::FeatureFlag> deny_at_disable_;
+  const std::optional<Runtime::FractionalPercent> filter_enabled_;
+  const std::optional<Matchers::MetadataMatcher> filter_enabled_metadata_;
+  const std::optional<Runtime::FeatureFlag> deny_at_disable_;
 
   // TODO(nezdolik): stop using pool as part of deprecating cluster scope stats.
   Stats::StatNamePool pool_;
@@ -348,6 +361,7 @@ private:
   const bool include_peer_certificate_;
   const bool include_tls_session_;
   const bool charge_cluster_response_stats_;
+  const bool emit_client_span_;
 
   // The stats for the filter.
   ExtAuthzFilterStats stats_;
@@ -376,7 +390,8 @@ public:
   using ContextExtensionsMap = Protobuf::Map<std::string, std::string>;
 
   FilterConfigPerRoute(
-      const envoy::extensions::filters::http::ext_authz::v3::ExtAuthzPerRoute& config)
+      const envoy::extensions::filters::http::ext_authz::v3::ExtAuthzPerRoute& config,
+      absl::Status& creation_status)
       : context_extensions_(config.has_check_settings()
                                 ? config.check_settings().context_extensions()
                                 : ContextExtensionsMap()),
@@ -385,16 +400,21 @@ public:
                             : envoy::extensions::filters::http::ext_authz::v3::CheckSettings()),
         disabled_(config.disabled()),
         grpc_service_(config.has_check_settings() && config.check_settings().has_grpc_service()
-                          ? absl::make_optional(config.check_settings().grpc_service())
-                          : absl::nullopt),
+                          ? std::make_optional(config.check_settings().grpc_service())
+                          : std::nullopt),
         http_service_(config.has_check_settings() && config.check_settings().has_http_service()
-                          ? absl::make_optional(config.check_settings().http_service())
-                          : absl::nullopt) {
+                          ? std::make_optional(config.check_settings().http_service())
+                          : std::nullopt),
+        emit_client_span_(
+            config.has_check_settings() && config.check_settings().has_emit_client_span()
+                ? std::make_optional(config.check_settings().emit_client_span().value())
+                : std::nullopt) {
     if (config.has_check_settings() && config.check_settings().disable_request_body_buffering() &&
         config.check_settings().has_with_request_body()) {
-      ExceptionUtil::throwEnvoyException(
+      creation_status = absl::InvalidArgumentError(
           "Invalid configuration for check_settings. Only one of disable_request_body_buffering or "
           "with_request_body can be set.");
+      return;
     }
   }
 
@@ -422,17 +442,22 @@ public:
   /**
    * @return The gRPC service override for this route, if any.
    */
-  const absl::optional<const envoy::config::core::v3::GrpcService>& grpcService() const {
+  const std::optional<const envoy::config::core::v3::GrpcService>& grpcService() const {
     return grpc_service_;
   }
 
   /**
    * @return The HTTP service override for this route, if any.
    */
-  const absl::optional<const envoy::extensions::filters::http::ext_authz::v3::HttpService>&
+  const std::optional<const envoy::extensions::filters::http::ext_authz::v3::HttpService>&
   httpService() const {
     return http_service_;
   }
+
+  /**
+   * @return The emit_client_span override for this route, if any.
+   */
+  const std::optional<bool>& emitClientSpan() const { return emit_client_span_; }
 
 private:
   // We save the context extensions as a protobuf map instead of a std::map as this allows us to
@@ -440,9 +465,10 @@ private:
   ContextExtensionsMap context_extensions_;
   envoy::extensions::filters::http::ext_authz::v3::CheckSettings check_settings_;
   const bool disabled_;
-  const absl::optional<const envoy::config::core::v3::GrpcService> grpc_service_;
-  const absl::optional<const envoy::extensions::filters::http::ext_authz::v3::HttpService>
+  const std::optional<const envoy::config::core::v3::GrpcService> grpc_service_;
+  const std::optional<const envoy::extensions::filters::http::ext_authz::v3::HttpService>
       http_service_;
+  std::optional<bool> emit_client_span_;
 };
 
 /**
@@ -523,7 +549,7 @@ private:
   Filters::Common::ExtAuthz::ClientPtr createPerRouteHttpClient(
       const envoy::extensions::filters::http::ext_authz::v3::HttpService& http_service);
 
-  absl::optional<MonotonicTime> start_time_;
+  std::optional<MonotonicTime> start_time_;
   void addResponseHeaders(Http::HeaderMap& header_map, const Http::HeaderVector& headers);
   void initiateCall(const Http::RequestHeaderMap& headers);
   void continueDecoding();
@@ -533,7 +559,7 @@ private:
   // of copying.
   void setShadowFilterState(Filters::Common::ExtAuthz::Response& response);
   bool isBufferFull(uint64_t num_bytes_processing) const;
-  void updateLoggingInfo(const absl::optional<Grpc::Status::GrpcStatus>& grpc_status);
+  void updateLoggingInfo(const std::optional<Grpc::Status::GrpcStatus>& grpc_status);
   void updateEffect(const Filters::Common::ProcessingEffect::Effect effect);
 
   // This holds a set of flags defined in per-route configuration.
@@ -556,15 +582,19 @@ private:
   Http::HeaderMapPtr getHeaderMap(const Filters::Common::ExtAuthz::ResponsePtr& response);
   FilterConfigSharedPtr config_;
   Filters::Common::ExtAuthz::ClientPtr client_;
+  // Per-route client that overrides the default client when specified by route configuration.
+  Filters::Common::ExtAuthz::ClientPtr per_route_client_;
+  // Raw pointer to the client currently serving an in-flight authorization request.
+  Filters::Common::ExtAuthz::Client* active_client_{nullptr};
   // Server context for creating per-route clients.
   Server::Configuration::ServerFactoryContext* server_context_{nullptr};
   Http::StreamDecoderFilterCallbacks* decoder_callbacks_{};
   Http::StreamEncoderFilterCallbacks* encoder_callbacks_{};
   Http::RequestHeaderMap* request_headers_;
-  Http::HeaderVector response_headers_to_add_{};
-  Http::HeaderVector response_headers_to_set_{};
-  Http::HeaderVector response_headers_to_add_if_absent_{};
-  Http::HeaderVector response_headers_to_overwrite_if_exists_{};
+  Http::HeaderVector response_headers_to_add_;
+  Http::HeaderVector response_headers_to_set_;
+  Http::HeaderVector response_headers_to_add_if_absent_;
+  Http::HeaderVector response_headers_to_overwrite_if_exists_;
   State state_{State::NotStarted};
   FilterReturn filter_return_{FilterReturn::ContinueDecoding};
   Upstream::ClusterInfoConstSharedPtr cluster_;
@@ -580,7 +610,7 @@ private:
   bool initiating_call_{};
   bool buffer_data_{};
   bool skip_check_{false};
-  envoy::service::auth::v3::CheckRequest check_request_{};
+  ArenaWrappedProto<envoy::service::auth::v3::CheckRequest> check_request_;
 };
 
 } // namespace ExtAuthz

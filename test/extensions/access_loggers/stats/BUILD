@@ -1,11 +1,11 @@
 load(
     "//bazel:envoy_build_system.bzl",
-    "envoy_benchmark_test",
-    "envoy_cc_benchmark_binary",
     "envoy_package",
 )
 load(
     "//test/extensions:extensions_build_system.bzl",
+    "envoy_extension_benchmark_test",
+    "envoy_extension_cc_benchmark_binary",
     "envoy_extension_cc_test",
 )
 
@@ -40,7 +40,7 @@ envoy_extension_cc_test(
         "//source/extensions/matching/actions/transform_stat:config",
         "//test/common/memory:memory_test_utility_lib",
         "//test/mocks/config:config_mocks",
-        "//test/mocks/server:factory_context_mocks",
+        "//test/mocks/server:server_factory_context_mocks",
         "//test/mocks/stream_info:stream_info_mocks",
         "//test/test_common:logging_lib",
         "//test/test_common:status_utility_lib",
@@ -56,7 +56,7 @@ envoy_extension_cc_test(
     size = "large",
     srcs = ["integration_test.cc"],
     extension_names = ["envoy.access_loggers.stats"],
-    rbe_pool = "6gig",
+    rbe_pool = "linux_x64_small",
     deps = [
         "//source/extensions/access_loggers/stats:config",
         "//source/extensions/filters/network/tcp_proxy:config",
@@ -69,23 +69,25 @@ envoy_extension_cc_test(
     ],
 )
 
-envoy_cc_benchmark_binary(
+envoy_extension_cc_benchmark_binary(
     name = "stats_speed_test",
     srcs = [
         "stats_speed_test.cc",
     ],
-    rbe_pool = "6gig",
+    extension_names = ["envoy.access_loggers.stats"],
+    rbe_pool = "linux_x64_small",
     deps = [
         "//source/common/stats:thread_local_store_lib",
         "//source/extensions/access_loggers/stats:stats_lib",
-        "//test/mocks/server:factory_context_mocks",
+        "//test/mocks/server:server_factory_context_mocks",
         "//test/mocks/stream_info:stream_info_mocks",
         "//test/test_common:utility_lib",
         "@benchmark",
     ],
 )
 
-envoy_benchmark_test(
+envoy_extension_benchmark_test(
     name = "stats_speed_test_benchmark_test",
     benchmark_binary = "stats_speed_test",
+    extension_names = ["envoy.access_loggers.stats"],
 )

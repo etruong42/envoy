@@ -3,6 +3,7 @@
 #include "source/common/formatter/substitution_format_string.h"
 #include "source/extensions/formatter/file_content/config.h"
 
+#include "test/common/formatter/formatter_test_utility.h"
 #include "test/mocks/server/factory_context.h"
 #include "test/mocks/stream_info/mocks.h"
 #include "test/test_common/environment.h"
@@ -131,10 +132,10 @@ TEST_F(FileContentFormatterTest, FormatValueReturnsStringValue) {
   auto empty_config = factory.createEmptyConfigProto();
   auto parser = factory.createCommandParserFromProto(*empty_config, context_);
 
-  auto provider = parser->parse("FILE_CONTENT", file_path, absl::nullopt);
+  auto provider = parser->parse("FILE_CONTENT", file_path, std::nullopt).value();
   ASSERT_NE(nullptr, provider);
 
-  auto value = provider->formatValue(formatter_context_, stream_info_);
+  auto value = Envoy::Formatter::formatValueForTest(*provider, formatter_context_, stream_info_);
   EXPECT_EQ("my-value", value.string_value());
 }
 
@@ -144,8 +145,30 @@ TEST_F(FileContentFormatterTest, FormatValueMissingFileReturnsEmpty) {
   auto empty_config = factory.createEmptyConfigProto();
   auto parser = factory.createCommandParserFromProto(*empty_config, context_);
 
-  auto provider = parser->parse("NOT_FILE_CONTENT", "/some/path", absl::nullopt);
+  auto provider = parser->parse("NOT_FILE_CONTENT", "/some/path", std::nullopt).value();
   EXPECT_EQ(nullptr, provider);
+}
+
+TEST_F(FileContentFormatterTest, UnsetThreadLocalDataIsMissingValue) {
+  const std::string file_path =
+      TestEnvironment::writeStringToFileForTest("deferred.txt", "my-value");
+
+  // Must be set before the provider is created, so that its slot->set() is deferred.
+  context_.server_factory_context_.thread_local_.defer_data_ = true;
+
+  FileContentFormatterFactory factory;
+  auto proto_config = factory.createEmptyConfigProto();
+  auto parser = factory.createCommandParserFromProto(*proto_config, context_);
+  ASSERT_NE(nullptr, parser);
+  auto provider = *parser->parse("FILE_CONTENT", file_path, std::nullopt);
+  ASSERT_NE(nullptr, provider);
+
+  // Covers both the string and the value paths, old and sink-based alike.
+  EXPECT_EQ(std::nullopt,
+            Envoy::Formatter::formatForTest(*provider, formatter_context_, stream_info_));
+  EXPECT_EQ(Protobuf::Value::KIND_NOT_SET,
+            Envoy::Formatter::formatValueForTest(*provider, formatter_context_, stream_info_)
+                .kind_case());
 }
 
 TEST_F(FileContentFormatterTest, WatchDirectoryUpdatesOnSymlinkSwap) {
@@ -173,11 +196,11 @@ TEST_F(FileContentFormatterTest, WatchDirectoryUpdatesOnSymlinkSwap) {
   auto parser = factory.createCommandParserFromProto(*empty_config, context_);
 
   const std::string subcommand = fmt::format("{}:{}", link, dir);
-  auto provider = parser->parse("FILE_CONTENT", subcommand, absl::nullopt);
+  auto provider = parser->parse("FILE_CONTENT", subcommand, std::nullopt).value();
   ASSERT_NE(nullptr, provider);
 
   // Initial content.
-  auto result = provider->format(formatter_context_, stream_info_);
+  auto result = Envoy::Formatter::formatForTest(*provider, formatter_context_, stream_info_);
   ASSERT_TRUE(result.has_value());
   EXPECT_EQ("original", *result);
 
@@ -186,7 +209,7 @@ TEST_F(FileContentFormatterTest, WatchDirectoryUpdatesOnSymlinkSwap) {
   dispatcher_->run(Event::Dispatcher::RunType::NonBlock);
 
   // Content should reflect the updated file.
-  result = provider->format(formatter_context_, stream_info_);
+  result = Envoy::Formatter::formatForTest(*provider, formatter_context_, stream_info_);
   ASSERT_TRUE(result.has_value());
   EXPECT_EQ("updated", *result);
 }
@@ -196,8 +219,8 @@ TEST_F(FileContentFormatterTest, TooManyColonsThrows) {
   auto empty_config = factory.createEmptyConfigProto();
   auto parser = factory.createCommandParserFromProto(*empty_config, context_);
 
-  EXPECT_THROW_WITH_REGEX(parser->parse("FILE_CONTENT", "/a:/b:/c", absl::nullopt), EnvoyException,
-                          "FILE_CONTENT: expected format");
+  EXPECT_THROW_WITH_REGEX(parser->parse("FILE_CONTENT", "/a:/b:/c", std::nullopt).value(),
+                          EnvoyException, "FILE_CONTENT: expected format");
 }
 
 } // namespace Formatter

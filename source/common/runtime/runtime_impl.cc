@@ -45,7 +45,21 @@ void countDeprecatedFeatureUseInternal(const RuntimeStats& stats) {
   stats.deprecated_feature_seen_since_process_start_.inc();
 }
 
-void refreshReloadableFlags(const Snapshot::EntryMap& flag_map) {
+void refreshReloadableFlags(const Snapshot::EntryMap& flag_map,
+                            absl::node_hash_map<std::string, bool>& runtime_feature_defaults) {
+  for (const auto& it : flag_map) {
+    if (it.second.bool_value_.has_value() && isRuntimeFeature(it.first)) {
+      runtime_feature_defaults.try_emplace(it.first, Runtime::runtimeFeatureEnabled(it.first));
+    }
+  }
+
+  for (const auto& it : runtime_feature_defaults) {
+    const auto flag = flag_map.find(it.first);
+    if (flag == flag_map.end() || !flag->second.bool_value_.has_value()) {
+      maybeSetRuntimeGuard(it.first, it.second);
+    }
+  }
+
   for (const auto& it : flag_map) {
     if (it.second.bool_value_.has_value() && isRuntimeFeature(it.first)) {
       maybeSetRuntimeGuard(it.first, it.second.bool_value_.value());
@@ -136,7 +150,7 @@ Snapshot::ConstStringOptRef SnapshotImpl::get(absl::string_view key) const {
   ASSERT(!isRuntimeFeature(key)); // Make sure runtime guarding is only used for getBoolean
   auto entry = key.empty() ? values_.end() : values_.find(key);
   if (entry == values_.end()) {
-    return absl::nullopt;
+    return std::nullopt;
   } else {
     return entry->second.raw_string_value_;
   }
@@ -455,8 +469,8 @@ absl::Status ProtoLayer::walkProtoValue(const Protobuf::Value& v, const std::str
     break;
   case Protobuf::Value::kStructValue: {
     const Protobuf::Struct& s = v.struct_value();
-    if (s.fields().empty() || s.fields().find("numerator") != s.fields().end() ||
-        s.fields().find("denominator") != s.fields().end()) {
+    if (s.fields().empty() || s.fields().contains("numerator") ||
+        s.fields().contains("denominator")) {
       SnapshotImpl::addEntry(values_, prefix, v, "");
       break;
     }
@@ -542,6 +556,8 @@ absl::Status LoaderImpl::initialize(Upstream::ClusterManager& cm) {
   return absl::OkStatus();
 }
 
+absl::Status LoaderImpl::onWorkerThreadsRegistered() { return loadNewSnapshot(); }
+
 void LoaderImpl::startRtdsSubscriptions(ReadyCallback on_done) {
   on_rtds_initialized_ = on_done;
   init_manager_.initialize(init_watcher_);
@@ -577,8 +593,8 @@ RtdsSubscription::onConfigUpdate(const std::vector<Config::DecodedResourceRef>& 
   if (!valid.ok()) {
     return valid;
   }
-  const auto& runtime =
-      dynamic_cast<const envoy::service::runtime::v3::Runtime&>(resources[0].get().resource());
+  const auto& runtime = Envoy::Protobuf::DynamicCastMessage<envoy::service::runtime::v3::Runtime>(
+      resources[0].get().resource());
   if (runtime.name() != resource_name_) {
     return absl::InvalidArgumentError(
         fmt::format("Unexpected RTDS runtime (expecting {}): {}", resource_name_, runtime.name()));
@@ -652,7 +668,7 @@ absl::Status LoaderImpl::loadNewSnapshot() {
     return std::static_pointer_cast<ThreadLocal::ThreadLocalObject>(ptr);
   });
 
-  refreshReloadableFlags(ptr->values());
+  refreshReloadableFlags(ptr->values(), runtime_feature_defaults_);
 
   {
     absl::MutexLock lock(snapshot_mutex_);
@@ -756,6 +772,7 @@ absl::StatusOr<SnapshotImplPtr> LoaderImpl::createNewSnapshot() {
     }
   }
   stats_.num_layers_.set(layers.size());
+  auto snapshot = std::make_unique<SnapshotImpl>(generator_, stats_, std::move(layers));
   if (error_layers == 0) {
     stats_.load_success_.inc();
   } else {
@@ -766,7 +783,7 @@ absl::StatusOr<SnapshotImplPtr> LoaderImpl::createNewSnapshot() {
   } else {
     stats_.override_dir_not_exists_.inc();
   }
-  return std::make_unique<SnapshotImpl>(generator_, stats_, std::move(layers));
+  return snapshot;
 }
 
 } // namespace Runtime

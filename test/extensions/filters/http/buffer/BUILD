@@ -15,7 +15,7 @@ envoy_extension_cc_test(
     name = "buffer_filter_test",
     srcs = ["buffer_filter_test.cc"],
     extension_names = ["envoy.filters.http.buffer"],
-    rbe_pool = "6gig",
+    rbe_pool = "linux_x64_small",
     deps = [
         "//envoy/event:dispatcher_interface",
         "//source/common/http:header_map_lib",
@@ -34,7 +34,7 @@ envoy_extension_cc_test(
     size = "large",
     srcs = ["buffer_filter_integration_test.cc"],
     extension_names = ["envoy.filters.http.buffer"],
-    rbe_pool = "6gig",
+    rbe_pool = "linux_x64_small",
     shard_count = 4,
     deps = [
         "//source/extensions/filters/http/buffer:config",
@@ -49,11 +49,10 @@ envoy_extension_cc_test(
     name = "config_test",
     srcs = ["config_test.cc"],
     extension_names = ["envoy.filters.http.buffer"],
-    rbe_pool = "6gig",
+    rbe_pool = "linux_x64_small",
     deps = [
         "//source/extensions/filters/http/buffer:config",
         "//test/mocks/server:factory_context_mocks",
-        "//test/mocks/server:instance_mocks",
         "//test/test_common:utility_lib",
         "@envoy_api//envoy/extensions/filters/http/buffer/v3:pkg_cc_proto",
     ],

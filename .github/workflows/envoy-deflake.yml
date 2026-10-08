@@ -17,8 +17,7 @@ on:
       bazel-args:
         description: Toolchain/test type
         type: string
-        default: >-
-          --config=clang
+        default: ''
       runs:
         description: 'Number of runs to test'
         type: number
@@ -35,6 +34,8 @@ jobs:
     uses: ./.github/workflows/_load_env.yml
 
   deflake:
+    secrets:
+      dockerhub-token: ${{ secrets.DOCKERHUB_TOKEN }}
     permissions:
       actions: read
       contents: read

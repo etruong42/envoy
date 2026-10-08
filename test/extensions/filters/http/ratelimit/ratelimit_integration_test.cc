@@ -22,6 +22,7 @@
 
 #include "gtest/gtest.h"
 
+using testing::Ge;
 namespace Envoy {
 namespace {
 
@@ -30,8 +31,7 @@ class RatelimitIntegrationTest : public Grpc::GrpcClientIntegrationParamTest,
                                  public HttpIntegrationTest {
 public:
   RatelimitIntegrationTest() : HttpIntegrationTest(Http::CodecClient::Type::HTTP2, ipVersion()) {
-    // TODO(ggreenway): add tag extraction rules.
-    skip_tag_extraction_rule_check_ = true;
+    skip_tag_extraction_rule_check_ = false;
   }
 
   void createUpstreams() override {
@@ -66,7 +66,7 @@ public:
 
       envoy::config::listener::v3::Filter ratelimit_filter;
       ratelimit_filter.set_name("envoy.filters.http.ratelimit");
-      ratelimit_filter.mutable_typed_config()->PackFrom(proto_config_);
+      std::ignore = ratelimit_filter.mutable_typed_config()->PackFrom(proto_config_);
       config_helper_.prependFilter(MessageUtil::getJsonStringFromMessageOrError(ratelimit_filter));
     });
     config_helper_.addConfigModifier(
@@ -363,8 +363,8 @@ TEST_P(RatelimitIntegrationTest, Timeout) {
   waitForRatelimitRequest();
   switch (clientType()) {
   case Grpc::ClientType::EnvoyGrpc:
-    test_server_->waitForCounterGe("cluster.ratelimit_cluster.upstream_rq_timeout", 1);
-    test_server_->waitForCounterGe("cluster.ratelimit_cluster.upstream_rq_504", 1);
+    test_server_->waitForCounter("cluster.ratelimit_cluster.upstream_rq_timeout", Ge(1));
+    test_server_->waitForCounter("cluster.ratelimit_cluster.upstream_rq_504", Ge(1));
     EXPECT_EQ(1, test_server_->counter("cluster.ratelimit_cluster.upstream_rq_timeout")->value());
     EXPECT_EQ(1, test_server_->counter("cluster.ratelimit_cluster.upstream_rq_504")->value());
     break;
@@ -802,6 +802,119 @@ TEST_P(RatelimitIntegrationTest, ClusterLocalityEntry) {
   waitForSuccessfulUpstreamResponse(0);
   cleanup();
 
+  EXPECT_EQ(1, test_server_->counter("cluster.cluster_0.ratelimit.ok")->value());
+}
+
+// End-to-end: a stream-done descriptor whose hits_addend is a %RESP() substitution resolves the
+// value from the upstream response header. This is the response-based rate limiting path that
+// previously required a dynamic-metadata hop.
+TEST_P(RatelimitIntegrationTest, ResponseHeaderHitsAddendOnStreamDone) {
+  base_filter_config_ = R"EOF(
+    domain: some_domain
+    timeout: 0.5s
+    rate_limits:
+    - actions:
+      - generic_key:
+          descriptor_value: on-request
+    - actions:
+      - generic_key:
+          descriptor_value: on-stream-done
+      hits_addend:
+        format: "%RESP(x-actual-cost)%"
+      apply_on_stream_done: true
+  )EOF";
+
+  initialize();
+
+  // The upstream response carries the cost header the stream-done descriptor reads via %RESP().
+  reinterpret_cast<AutonomousUpstream*>(fake_upstreams_.front().get())
+      ->setResponseHeaders(std::make_unique<Http::TestResponseHeaderMapImpl>(
+          Http::TestResponseHeaderMapImpl({{":status", "200"}, {"x-actual-cost", "7"}})));
+
+  initiateClientConnection();
+
+  // Request-path descriptor.
+  envoy::service::ratelimit::v3::RateLimitRequest expected_request_msg;
+  expected_request_msg.set_domain("some_domain");
+  auto* entry = expected_request_msg.add_descriptors()->add_entries();
+  entry->set_key("generic_key");
+  entry->set_value("on-request");
+  waitForRatelimitRequest(expected_request_msg);
+  sendRateLimitResponse(envoy::service::ratelimit::v3::RateLimitResponse::OK, {},
+                        Http::TestResponseHeaderMapImpl{}, Http::TestRequestHeaderMapImpl{}, 0);
+
+  // Keep the request-path stream alive to avoid a race between destroying it and receiving the
+  // stream-done request.
+  FakeStreamPtr first_stream = std::move(ratelimit_requests_[0]);
+
+  // Stream-done descriptor: populated on the response path with hits_addend resolved from the
+  // x-actual-cost response header.
+  expected_request_msg.mutable_descriptors()->Clear();
+  auto* descriptor = expected_request_msg.add_descriptors();
+  entry = descriptor->add_entries();
+  entry->set_key("generic_key");
+  entry->set_value("on-stream-done");
+  descriptor->mutable_hits_addend()->set_value(7);
+  waitForRatelimitRequest(expected_request_msg);
+  sendRateLimitResponse(envoy::service::ratelimit::v3::RateLimitResponse::OK, {},
+                        Http::TestResponseHeaderMapImpl{}, Http::TestRequestHeaderMapImpl{}, 0);
+
+  waitForSuccessfulUpstreamResponse(0);
+  cleanup();
+
+  // Only the request-path call bumps the ok counter; the stream-done call uses the detached
+  // callback which does not touch filter stats.
+  EXPECT_EQ(1, test_server_->counter("cluster.cluster_0.ratelimit.ok")->value());
+}
+
+// Backward-compat: when the response header referenced by %RESP() is absent, the stream-done
+// descriptor resolves to an empty (non-numeric) value and is dropped, so no stream-done rate limit
+// request is issued. Only the request-path call reaches the rate limit service.
+TEST_P(RatelimitIntegrationTest, ResponseHeaderHitsAddendMissingOnStreamDone) {
+  base_filter_config_ = R"EOF(
+    domain: some_domain
+    timeout: 0.5s
+    rate_limits:
+    - actions:
+      - generic_key:
+          descriptor_value: on-request
+    - actions:
+      - generic_key:
+          descriptor_value: on-stream-done
+      hits_addend:
+        format: "%RESP(x-actual-cost)%"
+      apply_on_stream_done: true
+  )EOF";
+
+  initialize();
+  initiateClientConnection();
+
+  // Request-path descriptor still reaches the rate limit service.
+  envoy::service::ratelimit::v3::RateLimitRequest expected_request_msg;
+  expected_request_msg.set_domain("some_domain");
+  auto* entry = expected_request_msg.add_descriptors()->add_entries();
+  entry->set_key("generic_key");
+  entry->set_value("on-request");
+  waitForRatelimitRequest(expected_request_msg);
+  sendRateLimitResponse(envoy::service::ratelimit::v3::RateLimitResponse::OK, {},
+                        Http::TestResponseHeaderMapImpl{}, Http::TestRequestHeaderMapImpl{}, 0);
+
+  waitForSuccessfulUpstreamResponse(0);
+  cleanup();
+
+  // The stream-done descriptor was dropped (no x-actual-cost header), so only the single
+  // request-path rate limit request was sent over the wire. The RLS request counter is
+  // client-type specific (EnvoyGrpc routes through the cluster manager; GoogleGrpc does not).
+  switch (clientType()) {
+  case Grpc::ClientType::EnvoyGrpc:
+    EXPECT_EQ(1, test_server_->counter("cluster.ratelimit_cluster.upstream_rq_total")->value());
+    break;
+  case Grpc::ClientType::GoogleGrpc:
+    EXPECT_EQ(1, test_server_->counter("grpc.ratelimit_cluster.streams_total")->value());
+    break;
+  default:
+    PANIC("reached unexpected code");
+  }
   EXPECT_EQ(1, test_server_->counter("cluster.cluster_0.ratelimit.ok")->value());
 }
 

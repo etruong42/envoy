@@ -1,31 +1,27 @@
 load("@rules_cc//cc:defs.bzl", "cc_binary", "cc_library")
+load("//bazel:toolchains.bzl", "LIBCLANG_CPP", "LIBLLVM")
 
 licenses(["notice"])  # Apache 2
-
-# Create a cc_library with LLVM headers
-cc_library(
-    name = "llvm_headers",
-    hdrs = ["@llvm_toolchain_llvm//:all_includes"],
-)
 
 cc_binary(
     name = "prefixer",
     srcs = ["prefixer.cpp"],
     additional_linker_inputs = [
-        "@llvm_toolchain_llvm//:lib/libclang-cpp.so.18.1",
-    ],
+        LIBCLANG_CPP,
+    ] + ([LIBLLVM] if LIBLLVM else []),
     copts = [
         "-fno-rtti",  # Required by libclang-cpp
-        "-isystem external/llvm_toolchain_llvm/include",
         # Use libstdc++ for ABI compatibility with libclang-cpp
         "-stdlib=libstdc++",
-        # Add libstdc++ include path from sysroot
-        "-isystem external/sysroot_linux_amd64/usr/include/c++/13",
-        "-isystem external/sysroot_linux_amd64/usr/include/x86_64-linux-gnu/c++/13",
+        # -isystem paths for the LLVM headers and the libstdc++ headers from the
+        # sysroot. These reference external repositories by their on-disk
+        # (canonical) name as materialised by bzlmod.
+        "-isystem external/envoy_toolshed++sysroot_extension+sysroot_linux_amd64/usr/include/c++/13",
+        "-isystem external/envoy_toolshed++sysroot_extension+sysroot_linux_amd64/usr/include/x86_64-linux-gnu/c++/13",
     ],
     linkopts = [
-        # Directly link to the versioned shared library
-        "$(location @llvm_toolchain_llvm//:lib/libclang-cpp.so.18.1)",
+        "$(location " + LIBCLANG_CPP + ")",
+    ] + (["$(location " + LIBLLVM + ")"] if LIBLLVM else []) + [
         "-Wl,-rpath,$$ORIGIN/../lib",
         # Use libstdc++ for ABI compatibility with libclang-cpp
         "-stdlib=libstdc++",
@@ -33,5 +29,5 @@ cc_binary(
         "-lstdc++",
     ],
     visibility = ["//visibility:public"],
-    deps = [":llvm_headers"],
+    deps = ["@llvm_toolchain_llvm//:clang_tooling_headers"],
 )

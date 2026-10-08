@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <optional>
 
 #include "envoy/access_log/access_log.h"
 #include "envoy/http/filter.h"
@@ -15,7 +16,6 @@
 #include "source/extensions/filters/common/expr/evaluator.h"
 
 #include "absl/container/flat_hash_map.h"
-#include "absl/types/optional.h"
 #include "contrib/envoy/extensions/filters/http/golang/v3alpha/golang.pb.h"
 #include "contrib/golang/filters/http/source/processor_state.h"
 #include "contrib/golang/filters/http/source/stats.h"
@@ -57,17 +57,17 @@ private:
 
 using MetricStoreSharedPtr = std::shared_ptr<MetricStore>;
 
+// NOLINTNEXTLINE(readability-identifier-naming)
 struct httpConfigInternal;
 
 class SecretReader {
 public:
   SecretReader(const envoy::extensions::filters::http::golang::v3alpha::Config& proto_config,
-               Server::Configuration::FactoryContext& context);
-  absl::optional<const std::string> secret(const std::string& name) const;
+               Server::Configuration::GenericFactoryContext& context);
+  std::optional<const std::string> secret(const std::string& name) const;
 
 private:
-  absl::flat_hash_map<std::string, std::unique_ptr<Secret::ThreadLocalGenericSecretProvider>>
-      secrets_;
+  absl::flat_hash_map<std::string, Secret::ThreadLocalGenericSecretProviderPtr> secrets_;
 };
 /**
  * Configuration for the HTTP golang extension filter.
@@ -77,7 +77,7 @@ class FilterConfig : public std::enable_shared_from_this<FilterConfig>,
 public:
   FilterConfig(const envoy::extensions::filters::http::golang::v3alpha::Config& proto_config,
                Dso::HttpFilterDsoPtr dso_lib, const std::string& stats_prefix,
-               Server::Configuration::FactoryContext& context);
+               Server::Configuration::GenericFactoryContext& context);
   ~FilterConfig();
 
   const std::string& soId() const { return so_id_; }
@@ -87,7 +87,7 @@ public:
   GolangFilterStats& stats() { return stats_; }
   const SecretReader& getSecretReader() const { return *secret_reader_; }
 
-  void newGoPluginConfig();
+  absl::Status newGoPluginConfig();
   CAPIStatus defineMetric(uint32_t metric_type, absl::string_view name, uint32_t* metric_id);
   CAPIStatus incrementMetric(uint32_t metric_id, int64_t offset);
   CAPIStatus getMetric(uint32_t metric_id, uint64_t* value);
@@ -215,7 +215,7 @@ public:
   }
 
   void setWeakFilter(std::weak_ptr<Filter> f) { filter_ = f; }
-  std::weak_ptr<Filter> weakFilter() { return filter_; }
+  const std::weak_ptr<Filter>& weakFilter() const { return filter_; }
 
   DecodingProcessorState& decodingState() { return decoding_state_; }
   EncodingProcessorState& encodingState() { return encoding_state_; }
@@ -357,6 +357,8 @@ private:
   const StreamInfo::StreamInfo& streamInfo() const { return decoding_state_.streamInfo(); }
   StreamInfo::StreamInfo& streamInfo() { return decoding_state_.streamInfo(); }
   bool isThreadSafe() { return decoding_state_.isThreadSafe(); };
+  // Lock for CAPI methods guarded by mutex_, null on the worker thread. See mutex_ below.
+  Thread::BasicLockable* offThreadMutex() { return isThreadSafe() ? nullptr : &mutex_; }
   Event::Dispatcher& getDispatcher() { return *dispatcher_; }
 
   bool doHeaders(ProcessorState& state, Http::RequestOrResponseHeaderMap& headers, bool end_stream);
@@ -388,8 +390,8 @@ private:
 
   CAPIStatus getStringPropertyCommon(absl::string_view path, uint64_t* value_data, int* value_len);
   CAPIStatus getStringPropertyInternal(absl::string_view path, std::string* result);
-  absl::optional<google::api::expr::runtime::CelValue> findValue(absl::string_view name,
-                                                                 Protobuf::Arena* arena);
+  std::optional<google::api::expr::runtime::CelValue> findValue(absl::string_view name,
+                                                                Protobuf::Arena* arena);
   CAPIStatus serializeStringValue(Filters::Common::Expr::CelValue value, std::string* result);
 
   const FilterConfigSharedPtr config_;
@@ -431,6 +433,10 @@ private:
   //    and committed to the deref, so the lock acquisition in onDestroy is what actually
   //    serialises the two sides.
   //
+  // Only off-thread callers take mutex_ (see offThreadMutex()). On the worker thread, onDestroy()
+  // cannot run concurrently with a CAPI call, and the Go side already serialises every
+  // req_->strValue writer under httpRequest.mutex.
+  //
   // The bare destroy-flag check (`if (hasDestroyed()) return CAPIFilterIsDestroy;`) does
   // NOT require this mutex; see has_destroyed_ below. CAPI methods whose only Envoy-side
   // work is either Filter-owned (e.g. doDataList buffers) or runs on the worker thread
@@ -448,10 +454,12 @@ private:
   std::atomic<bool> has_destroyed_{false};
 };
 
+// NOLINTNEXTLINE(readability-identifier-naming)
 struct httpConfigInternal : httpConfig {
   std::weak_ptr<FilterConfig> config_;
+  // NOLINTNEXTLINE(readability-identifier-naming)
   httpConfigInternal(std::weak_ptr<FilterConfig> c) { config_ = c; }
-  std::weak_ptr<FilterConfig> weakFilterConfig() { return config_; }
+  const std::weak_ptr<FilterConfig>& weakFilterConfig() const { return config_; }
 };
 
 } // namespace Golang

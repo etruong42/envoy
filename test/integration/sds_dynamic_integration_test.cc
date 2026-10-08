@@ -44,6 +44,8 @@
 #include "integration.h"
 #include "utility.h"
 
+using testing::Eq;
+using testing::Ge;
 namespace Envoy {
 namespace Ssl {
 
@@ -190,7 +192,7 @@ protected:
     envoy::service::discovery::v3::DiscoveryResponse discovery_response;
     discovery_response.set_version_info("1");
     discovery_response.set_type_url(Config::TestTypeUrl::get().Secret);
-    discovery_response.add_resources()->PackFrom(secret);
+    std::ignore = discovery_response.add_resources()->PackFrom(secret);
 
     xds_stream_->sendGrpcMessage(discovery_response);
   }
@@ -247,15 +249,19 @@ public:
               *ts->mutable_typed_config());
           configureSdsSecretConfig(quic_config.mutable_downstream_tls_context()
                                        ->mutable_session_ticket_keys_sds_secret_config());
-          ts->mutable_typed_config()->PackFrom(quic_config);
+          std::ignore = ts->mutable_typed_config()->PackFrom(quic_config);
         } else {
           auto tls_context = MessageUtil::anyConvert<
               envoy::extensions::transport_sockets::tls::v3::DownstreamTlsContext>(
               *ts->mutable_typed_config());
           configureSdsSecretConfig(tls_context.mutable_session_ticket_keys_sds_secret_config());
-          ts->mutable_typed_config()->PackFrom(tls_context);
+          std::ignore = ts->mutable_typed_config()->PackFrom(tls_context);
         }
       });
+    }
+
+    if (configure_keylog_) {
+      config_helper_.addRuntimeOverride("envoy.restart_features.quic_keylog_support", "true");
     }
 
     config_helper_.addConfigModifier([](envoy::config::bootstrap::v3::Bootstrap& bootstrap) {
@@ -271,7 +277,8 @@ public:
     });
 
     HttpIntegrationTest::initialize();
-    client_ssl_ctx_ = createClientSslTransportSocketFactory({}, context_manager_, *api_);
+    client_ssl_ctx_ = createClientSslTransportSocketFactory({}, context_manager_, *api_,
+                                                            &server_factory_context_.serverScope());
   }
 
   void configToUseSds(
@@ -279,14 +286,28 @@ public:
     common_tls_context.add_alpn_protocols(test_quic_ ? Http::Utility::AlpnNames::get().Http3
                                                      : Http::Utility::AlpnNames::get().Http11);
 
+    // Tests can set a context cipher to verify that certificate-level SDS parameters override it.
+    if (!context_cipher_suite_.empty()) {
+      common_tls_context.mutable_tls_params()->add_cipher_suites(context_cipher_suite_);
+    }
+
     auto* validation_context = common_tls_context.mutable_validation_context();
     validation_context->mutable_trusted_ca()->set_filename(
         TestEnvironment::runfilesPath("test/config/integration/certs/cacert.pem"));
     validation_context->add_verify_certificate_hash(TEST_CLIENT_CERT_HASH);
 
-    // Modify the listener ssl cert to use SDS from sds_cluster
+    // Modify the listener TLS certificate to use SDS.
     auto* secret_config_rsa = common_tls_context.add_tls_certificate_sds_secret_configs();
-    setUpSdsConfig(secret_config_rsa, server_cert_rsa_);
+    if (filesystem_sds_path_.empty()) {
+      setUpSdsConfig(secret_config_rsa, server_cert_rsa_);
+    } else {
+      secret_config_rsa->set_name(server_cert_rsa_);
+      auto* config_source = secret_config_rsa->mutable_sds_config();
+      config_source->set_resource_api_version(envoy::config::core::v3::ApiVersion::V3);
+      auto* path_config_source = config_source->mutable_path_config_source();
+      path_config_source->set_path(filesystem_sds_path_);
+      path_config_source->mutable_poll_interval()->set_nanos(50'000'000);
+    }
 
     // Add an additional SDS config for an EC cert (the base test has SDS config for an RSA cert).
     // This is done via the filesystem instead of gRPC to simplify the test setup.
@@ -351,6 +372,14 @@ resources:
       config_source->mutable_path_config_source()->set_path(sds_path);
       config_source->set_resource_api_version(envoy::config::core::v3::ApiVersion::V3);
     }
+
+    if (configure_keylog_) {
+      ConfigHelper::ServerSslOptions options;
+      options.setTlsKeyLogFilter(/*local=*/false, /*remote=*/false, /*local_negative=*/false,
+                                 /*remote_negative=*/false, keylog_path_, /*multiple_ips=*/false,
+                                 version_);
+      ConfigHelper::initializeTlsKeyLog(common_tls_context, options);
+    }
   }
 
   void createUpstreams() override {
@@ -361,11 +390,11 @@ resources:
   }
 
   void waitForSdsUpdateStats(size_t times) {
-    test_server_->waitForCounterGe(
+    test_server_->waitForCounter(
         listenerStatPrefix(test_quic_
                                ? "quic_server_transport_socket_factory.context_config_update_by_sds"
                                : "server_ssl_socket_factory.ssl_context_update_by_sds"),
-        times, std::chrono::milliseconds(5000));
+        Ge(times), std::chrono::milliseconds(5000));
   }
 
   void TearDown() override {
@@ -424,6 +453,15 @@ resources:
     TestEnvironment::writeStringToFileForTest("session_ticket_keys.sds.yaml", sds_content, false);
   }
 
+  void usePollingSds(const envoy::extensions::transport_sockets::tls::v3::Secret& secret) {
+    envoy::service::discovery::v3::DiscoveryResponse discovery_response;
+    discovery_response.set_version_info("initial");
+    discovery_response.set_type_url(Config::TestTypeUrl::get().Secret);
+    std::ignore = discovery_response.add_resources()->PackFrom(secret);
+    filesystem_sds_path_ = TestEnvironment::writeStringToFileForTest(
+        "server_cert_rsa.sds.yaml", MessageUtil::getYamlStringFromMessage(discovery_response));
+  }
+
 protected:
   Network::UpstreamTransportSocketFactoryPtr client_ssl_ctx_;
   bool dual_cert_{false};
@@ -432,6 +470,10 @@ protected:
   const std::string session_ticket_keys_secret_{"session_ticket_keys"};
   const std::string session_ticket_keys_sds_path_{
       TestEnvironment::temporaryPath("session_ticket_keys.sds.yaml")};
+  bool configure_keylog_{false};
+  const std::string keylog_path_{TestEnvironment::temporaryPath(TestUtility::uniqueFilename())};
+  std::string context_cipher_suite_;
+  std::string filesystem_sds_path_;
 };
 
 INSTANTIATE_TEST_SUITE_P(IpVersionsClientType, SdsDynamicDownstreamIntegrationTest,
@@ -491,6 +533,55 @@ TEST_P(SdsDynamicKeyRotationIntegrationTest, BasicRotation) {
   testRouterHeaderOnlyRequestAndResponse(&creator, dataPlaneUpstreamIndex());
 }
 
+TEST_P(SdsDynamicKeyRotationIntegrationTest, PollingRotation) {
+  v3_resource_api_ = true;
+  TestEnvironment::createPath(TestEnvironment::temporaryPath("root/current"));
+  TestEnvironment::writeStringToFileForTest(
+      TestEnvironment::temporaryPath("root/current/servercert.pem"),
+      TestEnvironment::readFileToStringForTest(
+          TestEnvironment::runfilesPath("test/config/integration/certs/servercert.pem")),
+      true);
+  TestEnvironment::writeStringToFileForTest(
+      TestEnvironment::temporaryPath("root/current/serverkey.pem"),
+      TestEnvironment::readFileToStringForTest(
+          TestEnvironment::runfilesPath("test/config/integration/certs/serverkey.pem")),
+      true);
+
+  // Use polling without a watched-directory fallback for either SDS or its certificate files.
+  auto secret = getCurrentServerSecret();
+  secret.mutable_tls_certificate()->clear_watched_directory();
+  usePollingSds(secret);
+  initialize();
+  waitForSdsUpdateStats(1);
+
+  ConnectionCreationFunction creator = [&]() -> Network::ClientConnectionPtr {
+    return makeSslClientConnection();
+  };
+  testRouterHeaderOnlyRequestAndResponse(&creator, dataPlaneUpstreamIndex());
+  cleanupUpstreamAndDownstream();
+
+  // Overwrite both files in place so no move event can trigger the rotation.
+  TestEnvironment::writeStringToFileForTest(
+      TestEnvironment::temporaryPath("root/current/servercert.pem"),
+      TestEnvironment::readFileToStringForTest(
+          TestEnvironment::runfilesPath("test/config/integration/certs/server_ecdsacert.pem")),
+      true, false);
+  TestEnvironment::writeStringToFileForTest(
+      TestEnvironment::temporaryPath("root/current/serverkey.pem"),
+      TestEnvironment::readFileToStringForTest(
+          TestEnvironment::runfilesPath("test/config/integration/certs/server_ecdsakey.pem")),
+      true, false);
+  waitForSdsUpdateStats(2);
+
+  // An ECDSA-only handshake proves the polled certificate and key reached the TLS context.
+  client_ssl_ctx_ = createClientSslTransportSocketFactory(
+      ClientSslTransportOptions()
+          .setTlsVersion(envoy::extensions::transport_sockets::tls::v3::TlsParameters::TLSv1_2)
+          .setCipherSuites({"ECDHE-ECDSA-AES128-GCM-SHA256"}),
+      context_manager_, *api_, &server_factory_context_.serverScope());
+  testRouterHeaderOnlyRequestAndResponse(&creator, dataPlaneUpstreamIndex());
+}
+
 // Validate that rotating to a directory with missing certs is handled.
 TEST_P(SdsDynamicKeyRotationIntegrationTest, EmptyRotation) {
   v3_resource_api_ = true;
@@ -516,7 +607,7 @@ TEST_P(SdsDynamicKeyRotationIntegrationTest, EmptyRotation) {
   // Rotate to an empty directory, this should fail.
   TestEnvironment::renameFile(TestEnvironment::temporaryPath("root/empty"),
                               TestEnvironment::temporaryPath("root/current"));
-  test_server_->waitForCounterEq("sds.server_cert_rsa.key_rotation_failed", 1);
+  test_server_->waitForCounter("sds.server_cert_rsa.key_rotation_failed", Eq(1));
   waitForSdsUpdateStats(1);
   // The rotation is not a SDS attempt, so no change to these stats.
   EXPECT_EQ(1, test_server_->counter("sds.server_cert_rsa.update_success")->value());
@@ -524,6 +615,79 @@ TEST_P(SdsDynamicKeyRotationIntegrationTest, EmptyRotation) {
 
   // Requests continue to work with key/cert pair.
   testRouterHeaderOnlyRequestAndResponse(&creator, dataPlaneUpstreamIndex());
+}
+
+// Validate that key logging keeps working across key-cert rotations, including
+// a rotation that races a connection's handshake:
+//   - A connection established before a rotation stays usable afterwards (its
+//     handshaker pinned the pre-rotation context).
+//   - A second rotation is kicked off and the next connection is opened
+//     immediately, so its handshake progresses in parallel with the context
+//     swap. The handshaker pins whichever context sslCtx() returns at
+//     construction time; both the pre- and post-rotation contexts are complete
+//     and valid (the swap is atomic under the factory mutex), so the handshake
+//     succeeds and key log lines are written no matter how the two interleave.
+// The test asserts only on those race-independent outcomes (request succeeds,
+// key log grows), so it is deterministic regardless of the interleaving.
+TEST_P(SdsDynamicKeyRotationIntegrationTest, KeyLogRotation) {
+  v3_resource_api_ = true;
+  configure_keylog_ = true;
+  TestEnvironment::exec(
+      {TestEnvironment::runfilesPath("test/integration/sds_dynamic_key_rotation_setup.sh")});
+
+  on_server_init_function_ = [this]() {
+    createSdsStream(*sdsUpstream());
+    sendSdsResponse(getCurrentServerSecret());
+  };
+  initialize();
+
+  // Initial update from filesystem.
+  waitForSdsUpdateStats(1);
+
+  // The first connection handshakes against the initial context and writes
+  // key log lines.
+  codec_client_ = makeHttpConnection(makeSslClientConnection());
+  sendRequestAndWaitForResponse(default_request_headers_, 0, default_response_headers_, 0,
+                                dataPlaneUpstreamIndex());
+  waitForAccessLogEntries(keylog_path_, /*client_connection=*/nullptr, /*min_entries=*/1);
+
+  // Rotate while the first connection stays open.
+  TestEnvironment::renameFile(TestEnvironment::temporaryPath("root/new"),
+                              TestEnvironment::temporaryPath("root/current"));
+  waitForSdsUpdateStats(2);
+
+  // The pre-rotation connection still serves requests after the swap.
+  sendRequestAndWaitForResponse(default_request_headers_, 0, default_response_headers_, 0,
+                                dataPlaneUpstreamIndex());
+  cleanupUpstreamAndDownstream();
+
+  // No handshake ran since the wait above, so the file holds only the first
+  // connection's lines (their number varies with the negotiated TLS version).
+  const auto entries_before = static_cast<uint32_t>(
+      waitForAccessLogEntries(keylog_path_, /*client_connection=*/nullptr, /*min_entries=*/1)
+          .size());
+
+  // Stage a symlink back to the RSA key/cert. After the first rotation
+  // root/current points at the ECDSA key/cert, so rotating to the RSA key/cert
+  // is a real cert change that triggers another SDS reload rather than a no-op.
+  TestEnvironment::createSymlink(TestEnvironment::temporaryPath("root/server"),
+                                 TestEnvironment::temporaryPath("root/next"));
+
+  // Trigger the second rotation and immediately open the next connection so its
+  // handshake races the context swap. Either order is valid (see the test
+  // comment), so assert only that the request succeeds and the key log grows.
+  TestEnvironment::renameFile(TestEnvironment::temporaryPath("root/next"),
+                              TestEnvironment::temporaryPath("root/current"));
+  codec_client_ = makeHttpConnection(makeSslClientConnection());
+  sendRequestAndWaitForResponse(default_request_headers_, 0, default_response_headers_, 0,
+                                dataPlaneUpstreamIndex());
+  waitForAccessLogEntries(keylog_path_, /*client_connection=*/nullptr,
+                          /*min_entries=*/entries_before + 1);
+
+  // Confirm the second rotation eventually applied, so the race above really
+  // exercised an in-flight context swap.
+  waitForSdsUpdateStats(3);
+  cleanupUpstreamAndDownstream();
 }
 
 // A test that SDS server send a good server secret for a static listener.
@@ -545,6 +709,57 @@ TEST_P(SdsDynamicDownstreamIntegrationTest, BasicSuccess) {
   EXPECT_EQ(0, test_server_->counter("sds.server_cert_rsa.update_rejected")->value());
 }
 
+// Verify that certificate-level TLS parameters delivered through SDS override the context-level
+// parameters and that a subsequent SDS update removes the override.
+TEST_P(SdsDynamicDownstreamIntegrationTest, CertificateTlsParams) {
+  if (test_quic_) {
+    GTEST_SKIP() << "QUIC uses TLS 1.3, which ignores the configured TLS 1.2 cipher suites";
+  }
+
+  // Set AES128 at the context level as the value the SDS certificate must override.
+  context_cipher_suite_ = "ECDHE-RSA-AES128-GCM-SHA256";
+  on_server_init_function_ = [this]() {
+    createSdsStream(*sdsUpstream());
+    auto secret = getServerSecretRsa();
+    // Deliver AES256 in the certificate-level TLS parameters through the ordinary SDS stream.
+    secret.mutable_tls_certificate()->mutable_tls_params()->add_cipher_suites(
+        "ECDHE-RSA-AES256-GCM-SHA384");
+    sendSdsResponse(secret);
+  };
+  initialize();
+
+  // Offer both ciphers so the server's effective certificate-level policy determines the result.
+  client_ssl_ctx_ = createClientSslTransportSocketFactory(
+      ClientSslTransportOptions{}
+          .setTlsVersion(envoy::extensions::transport_sockets::tls::v3::TlsParameters::TLSv1_2)
+          .setCipherSuites({"ECDHE-RSA-AES128-GCM-SHA256:ECDHE-RSA-AES256-GCM-SHA384"}),
+      context_manager_, *api_, &server_factory_context_.serverScope());
+  ConnectionCreationFunction creator = [&]() -> Network::ClientConnectionPtr {
+    return makeSslClientConnection();
+  };
+
+  testRouterHeaderOnlyRequestAndResponse(&creator, dataPlaneUpstreamIndex());
+  // The SDS certificate's AES256 restriction must override the context's AES128 restriction.
+  EXPECT_EQ(1, test_server_->counter(listenerStatPrefix("ssl.ciphers.ECDHE-RSA-AES256-GCM-SHA384"))
+                   ->value());
+  cleanupUpstreamAndDownstream();
+
+  // Remove certificate-level TLS parameters through SDS, leaving the context baseline in effect.
+  sendSdsResponse(getServerSecretRsa());
+  waitForSdsUpdateStats(2);
+
+  testRouterHeaderOnlyRequestAndResponse(&creator, dataPlaneUpstreamIndex());
+  // Without a certificate override, the context-level AES128 restriction must be restored.
+  EXPECT_EQ(1, test_server_->counter(listenerStatPrefix("ssl.ciphers.ECDHE-RSA-AES128-GCM-SHA256"))
+                   ->value());
+  // The unchanged AES256 count proves that the restored context baseline excludes AES256.
+  EXPECT_EQ(1, test_server_->counter(listenerStatPrefix("ssl.ciphers.ECDHE-RSA-AES256-GCM-SHA384"))
+                   ->value());
+  // Both SDS resources must be accepted: one adding the override and one removing it.
+  EXPECT_EQ(2, test_server_->counter("sds.server_cert_rsa.update_success")->value());
+  EXPECT_EQ(0, test_server_->counter("sds.server_cert_rsa.update_rejected")->value());
+}
+
 TEST_P(SdsDynamicDownstreamIntegrationTest, DualCert) {
   on_server_init_function_ = [this]() {
     createSdsStream(*sdsUpstream());
@@ -562,7 +777,7 @@ TEST_P(SdsDynamicDownstreamIntegrationTest, DualCert) {
       ClientSslTransportOptions()
           .setTlsVersion(envoy::extensions::transport_sockets::tls::v3::TlsParameters::TLSv1_2)
           .setCipherSuites({"ECDHE-ECDSA-AES128-GCM-SHA256"}),
-      context_manager_, *api_);
+      context_manager_, *api_, &server_factory_context_.serverScope());
   testRouterHeaderOnlyRequestAndResponse(&creator, dataPlaneUpstreamIndex());
 
   cleanupUpstreamAndDownstream();
@@ -570,7 +785,7 @@ TEST_P(SdsDynamicDownstreamIntegrationTest, DualCert) {
       ClientSslTransportOptions()
           .setTlsVersion(envoy::extensions::transport_sockets::tls::v3::TlsParameters::TLSv1_2)
           .setCipherSuites({"ECDHE-RSA-AES128-GCM-SHA256"}),
-      context_manager_, *api_);
+      context_manager_, *api_, &server_factory_context_.serverScope());
   testRouterHeaderOnlyRequestAndResponse(&creator, dataPlaneUpstreamIndex());
 
   // Success
@@ -611,9 +826,9 @@ TEST_P(SdsDynamicDownstreamIntegrationTest, MultipleCerts) {
           .setSni("www.lyft.com")
           .setTlsVersion(envoy::extensions::transport_sockets::tls::v3::TlsParameters::TLSv1_2)
           .setCipherSuites({"ECDHE-RSA-AES128-GCM-SHA256"}),
-      context_manager_, *api_);
+      context_manager_, *api_, &server_factory_context_.serverScope());
   auto ssl_client1 = makeSslClientConnection();
-  codec_client_ = makeRawHttpConnection(std::move(ssl_client1), absl::nullopt);
+  codec_client_ = makeRawHttpConnection(std::move(ssl_client1), std::nullopt);
   EXPECT_TRUE(codec_client_->connected());
   codec_client_->connection()->close(Network::ConnectionCloseType::NoFlush);
   // peer certificate is not present when using QUIC
@@ -629,9 +844,9 @@ TEST_P(SdsDynamicDownstreamIntegrationTest, MultipleCerts) {
           .setSni("www.lyft2.com")
           .setTlsVersion(envoy::extensions::transport_sockets::tls::v3::TlsParameters::TLSv1_2)
           .setCipherSuites({"ECDHE-RSA-AES128-GCM-SHA256"}),
-      context_manager_, *api_);
+      context_manager_, *api_, &server_factory_context_.serverScope());
   auto ssl_client2 = makeSslClientConnection();
-  codec_client_ = makeRawHttpConnection(std::move(ssl_client2), absl::nullopt);
+  codec_client_ = makeRawHttpConnection(std::move(ssl_client2), std::nullopt);
   EXPECT_TRUE(codec_client_->connected());
   codec_client_->connection()->close(Network::ConnectionCloseType::NoFlush);
   // peer certificate is not present when using QUIC
@@ -660,7 +875,7 @@ TEST_P(SdsDynamicDownstreamIntegrationTest, WrongSecretFirst) {
   };
   initialize();
 
-  codec_client_ = makeRawHttpConnection(makeSslClientConnection(), absl::nullopt);
+  codec_client_ = makeRawHttpConnection(makeSslClientConnection(), std::nullopt);
   // the connection state is not connected.
   EXPECT_FALSE(codec_client_->connected());
   codec_client_->connection()->close(Network::ConnectionCloseType::NoFlush);
@@ -767,12 +982,14 @@ public:
                                             ->mutable_clusters(dataPlaneUpstreamIndex())
                                             ->mutable_transport_socket();
       upstream_transport_socket->set_name("envoy.transport_sockets.tls");
-      upstream_transport_socket->mutable_typed_config()->PackFrom(upstream_tls_context);
+      std::ignore =
+          upstream_transport_socket->mutable_typed_config()->PackFrom(upstream_tls_context);
     });
 
     HttpIntegrationTest::initialize();
     registerTestServerPorts({"http"});
-    client_ssl_ctx_ = createClientSslTransportSocketFactory({}, context_manager_, *api_);
+    client_ssl_ctx_ = createClientSslTransportSocketFactory({}, context_manager_, *api_,
+                                                            &server_factory_context_.serverScope());
   }
 
   void configureInlinedCerts(
@@ -822,9 +1039,8 @@ public:
 
     auto cfg = *Extensions::TransportSockets::Tls::ServerContextConfigImpl::create(
         tls_context, factory_context_, {}, false);
-    static auto* upstream_stats_store = new Stats::TestIsolatedStoreImpl();
     return Extensions::TransportSockets::Tls::ServerSslSocketFactory::create(
-               std::move(cfg), context_manager_, *upstream_stats_store->rootScope())
+               std::move(cfg), context_manager_, server_factory_context_.serverScope())
         .value();
   }
 
@@ -899,8 +1115,8 @@ TEST_P(SdsDynamicDownstreamCertValidationContextTest, BasicWithSharedSecret) {
 
   // Wait for "ssl_context_updated_by_sds" counters to indicate that both resources
   // depending on the verification_secret were updated.
-  test_server_->waitForCounterGe(
-      "cluster.cluster_0.client_ssl_socket_factory.ssl_context_update_by_sds", 1);
+  test_server_->waitForCounter(
+      "cluster.cluster_0.client_ssl_socket_factory.ssl_context_update_by_sds", Ge(1));
   waitForSdsUpdateStats(1);
 
   ConnectionCreationFunction creator = [&]() -> Network::ClientConnectionPtr {
@@ -926,8 +1142,8 @@ TEST_P(SdsDynamicDownstreamCertValidationContextTest, CombinedValidationContextW
 
   // Wait for "ssl_context_updated_by_sds" counters to indicate that both resources
   // depending on the verification_secret were updated.
-  test_server_->waitForCounterGe(
-      "cluster.cluster_0.client_ssl_socket_factory.ssl_context_update_by_sds", 1);
+  test_server_->waitForCounter(
+      "cluster.cluster_0.client_ssl_socket_factory.ssl_context_update_by_sds", Ge(1));
   waitForSdsUpdateStats(1);
 
   ConnectionCreationFunction creator = [&]() -> Network::ClientConnectionPtr {
@@ -980,10 +1196,10 @@ public:
         envoy::extensions::transport_sockets::quic::v3::QuicUpstreamTransport quic_context;
         quic_context.mutable_upstream_tls_context()->CopyFrom(tls_context);
         transport_socket->set_name("envoy.transport_sockets.quic");
-        transport_socket->mutable_typed_config()->PackFrom(quic_context);
+        std::ignore = transport_socket->mutable_typed_config()->PackFrom(quic_context);
       } else {
         transport_socket->set_name("envoy.transport_sockets.tls");
-        transport_socket->mutable_typed_config()->PackFrom(tls_context);
+        std::ignore = transport_socket->mutable_typed_config()->PackFrom(tls_context);
       }
     });
 
@@ -1005,7 +1221,8 @@ public:
     // SDS cluster for the first cluster.
     addFakeUpstream(Http::CodecType::HTTP2);
     // FakeUpstream with SSL/TLS for the second cluster.
-    addFakeUpstream(createUpstreamSslContext(context_manager_, *api_, test_quic_),
+    addFakeUpstream(createUpstreamSslContext(context_manager_, *api_, test_quic_,
+                                             &server_factory_context_.serverScope()),
                     upstreamProtocol(), /*autonomous_upstream=*/false);
     xds_upstream_ = fake_upstreams_.front().get();
   }
@@ -1031,8 +1248,8 @@ TEST_P(SdsDynamicUpstreamIntegrationTest, BasicSuccess) {
   // the testing request will be called, even though in the pre_worker_function, a good sds is
   // send, the cluster will be updated with good secret, the testing request may fail if it is
   // before context is updated. Hence, need to wait for context_update counter.
-  test_server_->waitForCounterGe(
-      "cluster.cluster_0.client_ssl_socket_factory.ssl_context_update_by_sds", 1);
+  test_server_->waitForCounter(
+      "cluster.cluster_0.client_ssl_socket_factory.ssl_context_update_by_sds", Ge(1));
 
   testRouterHeaderOnlyRequestAndResponse(/*create_connection=*/nullptr, dataPlaneUpstreamIndex());
 
@@ -1065,14 +1282,14 @@ TEST_P(SdsDynamicUpstreamIntegrationTest, WrongSecretFirst) {
     ASSERT_TRUE(fake_upstream_connection->waitForDisconnect());
   }
 
-  test_server_->waitForCounterGe("sds.client_cert.update_rejected", 1);
+  test_server_->waitForCounter("sds.client_cert.update_rejected", Ge(1));
   EXPECT_EQ(0, test_server_->counter("sds.client_cert.update_success")->value());
 
   sendSdsResponse(getClientSecret());
-  test_server_->waitForCounterGe(
-      "cluster.cluster_0.client_ssl_socket_factory.ssl_context_update_by_sds", 1);
+  test_server_->waitForCounter(
+      "cluster.cluster_0.client_ssl_socket_factory.ssl_context_update_by_sds", Ge(1));
 
-  test_server_->waitForCounterGe("sds.client_cert.update_success", 1);
+  test_server_->waitForCounter("sds.client_cert.update_success", Ge(1));
   EXPECT_EQ(1, test_server_->counter("sds.client_cert.update_rejected")->value());
 
   // Verify the update succeeded.
@@ -1123,7 +1340,7 @@ public:
       setUpSdsConfig(secret_config, "client_cert");
 
       transport_socket->set_name("envoy.transport_sockets.tls");
-      transport_socket->mutable_typed_config()->PackFrom(tls_context);
+      std::ignore = transport_socket->mutable_typed_config()->PackFrom(tls_context);
 
       // Set up the Bootstrap's CDS config to fetch from the CDS cluster.
       const std::string cds_yaml = R"EOF(
@@ -1180,7 +1397,7 @@ public:
     envoy::service::discovery::v3::DiscoveryResponse discovery_response;
     discovery_response.set_version_info("1");
     discovery_response.set_type_url(Config::TestTypeUrl::get().Secret);
-    discovery_response.add_resources()->PackFrom(secret);
+    std::ignore = discovery_response.add_resources()->PackFrom(secret);
     sds_stream.sendGrpcMessage(discovery_response);
   }
 
@@ -1216,15 +1433,15 @@ TEST_P(SdsCdsIntegrationTest, BasicSuccess) {
   };
   initialize();
 
-  test_server_->waitForCounterGe(
-      "cluster.dynamic.client_ssl_socket_factory.ssl_context_update_by_sds", 1);
+  test_server_->waitForCounter(
+      "cluster.dynamic.client_ssl_socket_factory.ssl_context_update_by_sds", Ge(1));
   // The 4 clusters are CDS,SDS,static and dynamic cluster.
-  test_server_->waitForGaugeGe("cluster_manager.active_clusters", 4);
+  test_server_->waitForGauge("cluster_manager.active_clusters", Ge(4));
 
   sendDiscoveryResponse<envoy::config::cluster::v3::Cluster>(Config::TestTypeUrl::get().Cluster, {},
                                                              {}, {}, "42");
   // Successfully removed the dynamic cluster.
-  test_server_->waitForGaugeEq("cluster_manager.active_clusters", 3);
+  test_server_->waitForGauge("cluster_manager.active_clusters", Eq(3));
 }
 
 // Test SDS cluster with dynamic cluster i.e. declared via CDS.
@@ -1292,7 +1509,7 @@ public:
       setUpSdsConfig(secret_config, "client_cert", sds_cluster_name_);
 
       transport_socket->set_name("envoy.transport_sockets.tls");
-      transport_socket->mutable_typed_config()->PackFrom(tls_context);
+      std::ignore = transport_socket->mutable_typed_config()->PackFrom(tls_context);
 
       // Set up the Bootstrap's CDS config to fetch from the CDS cluster.
       const std::string cds_yaml = R"EOF(
@@ -1356,7 +1573,7 @@ public:
     envoy::service::discovery::v3::DiscoveryResponse discovery_response;
     discovery_response.set_version_info("1");
     discovery_response.set_type_url(Config::TestTypeUrl::get().Secret);
-    discovery_response.add_resources()->PackFrom(secret);
+    std::ignore = discovery_response.add_resources()->PackFrom(secret);
     sds_stream.sendGrpcMessage(discovery_response);
   }
 
@@ -1401,19 +1618,19 @@ TEST_P(SdsDynamicClusterIntegrationTest, BasicSuccess) {
   }
 
   // Validate that Envoy accepts SDS as dynamic cluster and moves to Live state.
-  test_server_->waitForGaugeGe("server.state", 0);
-  test_server_->waitForGaugeGe("server.live", 1);
+  test_server_->waitForGauge("server.state", Ge(0));
+  test_server_->waitForGauge("server.live", Ge(1));
 
   // Validate that the sds update was successful.
-  test_server_->waitForCounterGe("sds.client_cert.update_success", 1);
+  test_server_->waitForCounter("sds.client_cert.update_success", Ge(1));
 
   // The 4 clusters are CDS,SDS,static and dynamic cluster.
-  test_server_->waitForGaugeGe("cluster_manager.active_clusters", 4);
+  test_server_->waitForGauge("cluster_manager.active_clusters", Ge(4));
 
   sendDiscoveryResponse<envoy::config::cluster::v3::Cluster>(Config::TestTypeUrl::get().Cluster, {},
                                                              {}, {}, "42");
   // Successfully removed the dynamic cluster.
-  test_server_->waitForGaugeEq("cluster_manager.active_clusters", 2);
+  test_server_->waitForGauge("cluster_manager.active_clusters", Eq(2));
 }
 
 // Validate that Envoy accepts bootstrap EDS cluster in SDS ApiConfigSource.
@@ -1445,19 +1662,19 @@ TEST_P(SdsDynamicClusterIntegrationTest, EdsBootStrapCluster) {
   }
 
   // Validate that Envoy accepts SDS as dynamic cluster and moves to Live state.
-  test_server_->waitForGaugeGe("server.state", 0);
-  test_server_->waitForGaugeGe("server.live", 1);
+  test_server_->waitForGauge("server.state", Ge(0));
+  test_server_->waitForGauge("server.live", Ge(1));
 
   // Validate that the sds update was successful.
-  test_server_->waitForCounterGe("sds.client_cert.update_success", 1);
+  test_server_->waitForCounter("sds.client_cert.update_success", Ge(1));
 
   // The 4 clusters are CDS,SDS,static and dynamic cluster.
-  test_server_->waitForGaugeGe("cluster_manager.active_clusters", 4);
+  test_server_->waitForGauge("cluster_manager.active_clusters", Ge(4));
 
   sendDiscoveryResponse<envoy::config::cluster::v3::Cluster>(Config::TestTypeUrl::get().Cluster, {},
                                                              {}, {}, "42");
   // Successfully removed the dynamic cluster.
-  test_server_->waitForGaugeEq("cluster_manager.active_clusters", 3);
+  test_server_->waitForGauge("cluster_manager.active_clusters", Eq(3));
 }
 
 // Validate that Envoy starts fine with a non-existent CDS cluster in SDS ApiConfigSource.
@@ -1478,19 +1695,19 @@ TEST_P(SdsDynamicClusterIntegrationTest, ClusterRefersNonExistentSdsCluster) {
   initialize();
 
   // Validate that Envoy accepts SDS as dynamic cluster and moves to Live state.
-  test_server_->waitForGaugeGe("server.state", 0);
-  test_server_->waitForGaugeGe("server.live", 1);
+  test_server_->waitForGauge("server.state", Ge(0));
+  test_server_->waitForGauge("server.live", Ge(1));
 
   // Validate that the secret update failed because SDS cluster is not found.
-  test_server_->waitForCounterGe("sds.client_cert.update_failure", 1);
+  test_server_->waitForCounter("sds.client_cert.update_failure", Ge(1));
 
   // The 3 clusters are CDS, static and dynamic cluster.
-  test_server_->waitForGaugeGe("cluster_manager.active_clusters", 3);
+  test_server_->waitForGauge("cluster_manager.active_clusters", Ge(3));
 
   sendDiscoveryResponse<envoy::config::cluster::v3::Cluster>(Config::TestTypeUrl::get().Cluster, {},
                                                              {}, {}, "42");
   // Successfully removed the dynamic cluster.
-  test_server_->waitForGaugeEq("cluster_manager.active_clusters", 2);
+  test_server_->waitForGauge("cluster_manager.active_clusters", Eq(2));
 }
 
 // Validate that Envoy starts fine with a cyclic dependency between CDS and SDS clusters
@@ -1512,17 +1729,17 @@ TEST_P(SdsDynamicClusterIntegrationTest, CdsSdsCyclicDependency) {
   initialize();
 
   // Validate that Envoy accepts SDS as dynamic cluster and moves to Live state.
-  test_server_->waitForGaugeGe("server.state", 0);
-  test_server_->waitForGaugeGe("server.live", 1);
-  test_server_->waitForCounterGe("sds.client_cert.update_failure", 1);
+  test_server_->waitForGauge("server.state", Ge(0));
+  test_server_->waitForGauge("server.live", Ge(1));
+  test_server_->waitForCounter("sds.client_cert.update_failure", Ge(1));
 
   // The 3 clusters are CDS, static and dynamic cluster.
-  test_server_->waitForGaugeGe("cluster_manager.active_clusters", 3);
+  test_server_->waitForGauge("cluster_manager.active_clusters", Ge(3));
 
   sendDiscoveryResponse<envoy::config::cluster::v3::Cluster>(Config::TestTypeUrl::get().Cluster, {},
                                                              {}, {}, "42");
   // Successfully removed the dynamic cluster.
-  test_server_->waitForGaugeEq("cluster_manager.active_clusters", 2);
+  test_server_->waitForGauge("cluster_manager.active_clusters", Eq(2));
 }
 
 // This test verifies that health checks do NOT start before SDS secrets are delivered.
@@ -1567,7 +1784,7 @@ TEST_P(SdsDynamicClusterIntegrationTest, ClusterWarmingWhileHealthCheckBlocksOnS
   initialize();
 
   // Wait for the dynamic cluster to exist and be in warming state.
-  test_server_->waitForGaugeEq("cluster.dynamic.warming_state", 1);
+  test_server_->waitForGauge("cluster.dynamic.warming_state", Eq(1));
 
   // Health checks must NOT have started while cluster is warming.
   // Note: The counter may exist but its value should be 0.
@@ -1579,12 +1796,12 @@ TEST_P(SdsDynamicClusterIntegrationTest, ClusterWarmingWhileHealthCheckBlocksOnS
   sendSdsResponse2(getClientSecret(), *sds_stream_);
 
   // After SDS secrets are delivered, health checks should start.
-  test_server_->waitForCounterGe("cluster.dynamic.health_check.attempt", 1);
+  test_server_->waitForCounter("cluster.dynamic.health_check.attempt", Ge(1));
 
   // Clean up.
   sendDiscoveryResponse<envoy::config::cluster::v3::Cluster>(Config::TestTypeUrl::get().Cluster, {},
                                                              {}, {}, "42");
-  test_server_->waitForGaugeEq("cluster_manager.active_clusters", 2);
+  test_server_->waitForGauge("cluster_manager.active_clusters", Eq(2));
 }
 
 // This test verifies that with the runtime guard DISABLED, health checks starts and cluster becomes
@@ -1631,22 +1848,22 @@ TEST_P(SdsDynamicClusterIntegrationTest, ClusterWarmingWhileHealthCheckBlocksOnS
   initialize();
 
   // Wait for the dynamic cluster to exist and be in warming state.
-  test_server_->waitForGaugeEq("cluster.dynamic.warming_state", 1);
+  test_server_->waitForGauge("cluster.dynamic.warming_state", Eq(1));
 
   // With the runtime guard DISABLED, health checks start immediately (old behavior).
-  test_server_->waitForCounterGe("cluster.dynamic.health_check.attempt", 1);
-  test_server_->waitForGaugeEq("cluster.dynamic.membership_healthy", 0);
+  test_server_->waitForCounter("cluster.dynamic.health_check.attempt", Ge(1));
+  test_server_->waitForGauge("cluster.dynamic.membership_healthy", Eq(0));
 
   // Now send the SDS response with actual client certificate.
   sendSdsResponse2(getClientSecret(), *sds_stream_);
 
   // After SDS secrets are delivered, the cluster finishes warming.
-  test_server_->waitForGaugeEq("cluster.dynamic.warming_state", 0);
+  test_server_->waitForGauge("cluster.dynamic.warming_state", Eq(0));
 
   // Clean up.
   sendDiscoveryResponse<envoy::config::cluster::v3::Cluster>(Config::TestTypeUrl::get().Cluster, {},
                                                              {}, {}, "42");
-  test_server_->waitForGaugeEq("cluster_manager.active_clusters", 2);
+  test_server_->waitForGauge("cluster_manager.active_clusters", Eq(2));
 }
 
 class SdsDynamicDownstreamPrivateKeyIntegrationTest : public SdsDynamicDownstreamIntegrationTest {
@@ -1776,15 +1993,15 @@ BORINGSSL_TEST_P(SdsCdsPrivateKeyIntegrationTest, BasicSdsCdsPrivateKeyProvider)
   };
   initialize();
 
-  test_server_->waitForCounterGe(
-      "cluster.dynamic.client_ssl_socket_factory.ssl_context_update_by_sds", 1);
+  test_server_->waitForCounter(
+      "cluster.dynamic.client_ssl_socket_factory.ssl_context_update_by_sds", Ge(1));
   // The 4 clusters are CDS,SDS,static and dynamic cluster.
-  test_server_->waitForGaugeGe("cluster_manager.active_clusters", 4);
+  test_server_->waitForGauge("cluster_manager.active_clusters", Ge(4));
 
   sendDiscoveryResponse<envoy::config::cluster::v3::Cluster>(Config::TestTypeUrl::get().Cluster, {},
                                                              {}, {}, "42");
   // Successfully removed the dynamic cluster.
-  test_server_->waitForGaugeEq("cluster_manager.active_clusters", 3);
+  test_server_->waitForGauge("cluster_manager.active_clusters", Eq(3));
 }
 
 } // namespace Ssl

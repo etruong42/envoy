@@ -1,6 +1,7 @@
 #include <memory>
 #include <vector>
 
+#include "envoy/common/logger.h"
 #include "envoy/server/filter_config.h"
 
 #include "source/extensions/listener_managers/validation_listener_manager/validation_listener_manager.h"
@@ -16,6 +17,7 @@
 #include "test/mocks/server/options.h"
 #include "test/mocks/stats/mocks.h"
 #include "test/test_common/environment.h"
+#include "test/test_common/file_system_for_test.h"
 #include "test/test_common/network_utility.h"
 #include "test/test_common/registry.h"
 #include "test/test_common/test_time.h"
@@ -82,8 +84,7 @@ public:
   }
 
   static void setupTestDirectory() {
-    directory_ =
-        TestEnvironment::runfilesDirectory("envoy/test/server/config_validation/test_data/");
+    directory_ = TestEnvironment::runfilesPath("test/server/config_validation/test_data/");
   }
 
   static const std::vector<std::string> getAllConfigFiles() {
@@ -99,8 +100,7 @@ public:
   }
 
   static void setupTestDirectory() {
-    directory_ =
-        TestEnvironment::runfilesDirectory("envoy/test/server/config_validation/test_data/");
+    directory_ = TestEnvironment::runfilesPath("test/server/config_validation/test_data/");
   }
 
   static const std::vector<std::string> getAllConfigFiles() {
@@ -115,8 +115,7 @@ public:
     setupTestDirectory();
   }
   static void setupTestDirectory() {
-    directory_ =
-        TestEnvironment::runfilesDirectory("envoy/test/server/config_validation/test_data/");
+    directory_ = TestEnvironment::runfilesPath("test/server/config_validation/test_data/");
   }
   static const std::vector<std::string> getAllConfigFiles() {
     setupTestDirectory();
@@ -130,8 +129,7 @@ public:
     setupTestDirectory();
   }
   static void setupTestDirectory() {
-    directory_ =
-        TestEnvironment::runfilesDirectory("envoy/test/server/config_validation/test_data/");
+    directory_ = TestEnvironment::runfilesPath("test/server/config_validation/test_data/");
   }
   static const std::vector<std::string> getAllConfigFiles() {
     setupTestDirectory();
@@ -146,8 +144,7 @@ public:
   }
 
   static void setupTestDirectory() {
-    directory_ =
-        TestEnvironment::runfilesDirectory("envoy/test/server/config_validation/test_data/");
+    directory_ = TestEnvironment::runfilesPath("test/server/config_validation/test_data/");
   }
 
   static const std::vector<std::string> getAllConfigFiles() {
@@ -190,7 +187,7 @@ TEST_P(ValidationServerTest, DummyMethodsTest) {
                             Filesystem::fileSystemForTest());
 
   // Execute dummy methods.
-  server.drainListeners(absl::nullopt);
+  server.drainListeners(std::nullopt);
   server.failHealthcheck(true);
   server.lifecycleNotifier();
   server.secretManager();
@@ -258,7 +255,7 @@ TEST_P(ValidationServerTest, WithProcessContext) {
                             Filesystem::fileSystemForTest(), process_context);
   EXPECT_TRUE(server.processContext().has_value());
   auto context = server.processContext();
-  auto& object_from_context = dynamic_cast<TestObject&>(context->get().get());
+  auto& object_from_context = dynamic_cast<TestObject&>(context->get());
   EXPECT_EQ(&object_from_context, &object);
   EXPECT_TRUE(object_from_context.boolean_flag_);
 
@@ -367,7 +364,7 @@ TEST_P(JsonApplicationLogsValidationServerTest, JsonApplicationLogs) {
                             access_log_lock, component_factory_, Thread::threadFactoryForTest(),
                             Filesystem::fileSystemForTest());
 
-  Envoy::Logger::Registry::setLogLevel(spdlog::level::info);
+  Envoy::Logger::Registry::setLogLevel(Logger::Levels::info);
   MockLogSink sink(Envoy::Logger::Registry::getSink());
   EXPECT_CALL(sink, log(_, _)).WillOnce(Invoke([](auto msg, auto& log) {
     EXPECT_THAT(msg, HasSubstr("{\"MessageFromProto\":\"hello\"}"));
@@ -427,7 +424,7 @@ TEST_P(TextApplicationLogsValidationServerTest, TextApplicationLogs) {
                             access_log_lock, component_factory_, Thread::threadFactoryForTest(),
                             Filesystem::fileSystemForTest());
 
-  Envoy::Logger::Registry::setLogLevel(spdlog::level::info);
+  Envoy::Logger::Registry::setLogLevel(Logger::Levels::info);
   MockLogSink sink(Envoy::Logger::Registry::getSink());
   EXPECT_CALL(sink, log(_, _)).WillOnce(Invoke([](auto msg, auto& log) {
     EXPECT_THAT(msg, HasSubstr("[lvl: info][msg: hello]"));
@@ -449,8 +446,7 @@ public:
   }
 
   static void setupTestDirectory() {
-    directory_ =
-        TestEnvironment::runfilesDirectory("envoy/test/server/config_validation/test_data/");
+    directory_ = TestEnvironment::runfilesPath("test/server/config_validation/test_data/");
   }
 
   static const std::vector<std::string> getAllConfigFiles() {

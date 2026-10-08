@@ -253,6 +253,18 @@ INSTANTIATE_TEST_SUITE_P(EnvoyQuicClientSessionTests, EnvoyQuicClientSessionTest
 
 TEST_P(EnvoyQuicClientSessionTest, ShutdownNoOp) { http_connection_->shutdownNotice(); }
 
+#ifdef ENVOY_ENABLE_HTTP_DATAGRAMS
+// WebTransport is opt-in: the client advertises no WebTransport versions (and so will not negotiate
+// WebTransport) unless envoy.reloadable_features.quic_support_web_transport is enabled.
+TEST_P(EnvoyQuicClientSessionTest, WebTransportNegotiationGatedByRuntimeFlag) {
+  EXPECT_FALSE(envoy_quic_session_->WillNegotiateWebTransport());
+
+  TestScopedRuntime scoped_runtime;
+  scoped_runtime.mergeValues({{"envoy.reloadable_features.quic_support_web_transport", "true"}});
+  EXPECT_TRUE(envoy_quic_session_->WillNegotiateWebTransport());
+}
+#endif
+
 INSTANTIATE_TEST_SUITE_P(EnvoyQuicClientSessionTest, EnvoyQuicClientSessionTest,
                          testing::Combine(testing::ValuesIn(quic::CurrentSupportedHttp3Versions()),
                                           testing::Bool()));
@@ -565,10 +577,13 @@ TEST_P(EnvoyQuicClientSessionTest, StatelessResetOnProbingSocket) {
   EXPECT_NE(new_self_address->asString(), self_addr_->asString());
 
   // Send a STATELESS_RESET packet to the probing socket.
+  quic::StatelessResetToken reset_token =
+      GetQuicReloadableFlag(quic_check_alternate_reset_token)
+          ? frame.stateless_reset_token
+          : quic::QuicUtils::GenerateStatelessResetToken(quic::test::TestConnectionId());
   std::unique_ptr<quic::QuicEncryptedPacket> stateless_reset_packet =
-      quic::QuicFramer::BuildIetfStatelessResetPacket(
-          frame.connection_id, /*received_packet_length*/ 1200,
-          quic::QuicUtils::GenerateStatelessResetToken(quic::test::TestConnectionId()));
+      quic::QuicFramer::BuildIetfStatelessResetPacket(frame.connection_id,
+                                                      /*received_packet_length*/ 1200, reset_token);
   Buffer::RawSlice slice;
   slice.mem_ = const_cast<char*>(stateless_reset_packet->data());
   slice.len_ = stateless_reset_packet->length();
@@ -588,7 +603,7 @@ TEST_P(EnvoyQuicClientSessionTest, StatelessResetOnProbingSocket) {
 
 TEST_P(EnvoyQuicClientSessionTest, EcnReportingIsEnabled) {
   const Network::ConnectionSocketPtr& socket = quic_connection_->connectionSocket();
-  absl::optional<Network::Address::IpVersion> version = socket->ipVersion();
+  std::optional<Network::Address::IpVersion> version = socket->ipVersion();
   EXPECT_TRUE(version.has_value());
   int optval;
   socklen_t optlen = sizeof(optval);
@@ -603,7 +618,7 @@ TEST_P(EnvoyQuicClientSessionTest, EcnReportingIsEnabled) {
 }
 
 TEST_P(EnvoyQuicClientSessionTest, EcnReporting) {
-  absl::optional<Network::Address::IpVersion> version = peer_socket_->ipVersion();
+  std::optional<Network::Address::IpVersion> version = peer_socket_->ipVersion();
   EXPECT_TRUE(version.has_value());
   // Make the peer socket send ECN marks
   Api::SysCallIntResult rv;
@@ -949,6 +964,35 @@ TEST_P(EnvoyQuicClientSessionTest, SconeStateInitialization) {
   ASSERT_TRUE(filter_state->hasData<SconeState>(SconeStateKey));
   auto scone_state = filter_state->getDataReadOnly<SconeState>(SconeStateKey);
   EXPECT_FALSE(scone_state->scone_max_kbps.has_value());
+}
+
+TEST_P(EnvoyQuicClientSessionTest, ScopedIpv6PortMigrationCrash) {
+  // Create a local address with scope ID 1.
+  sockaddr_in6 sa6_local;
+  memset(&sa6_local, 0, sizeof(sa6_local));
+  sa6_local.sin6_family = AF_INET6;
+  sa6_local.sin6_port = htons(54321);
+  sa6_local.sin6_scope_id = 1;
+  inet_pton(AF_INET6, "fe80::1", &sa6_local.sin6_addr);
+  auto scoped_v6_local_addr = std::make_shared<Network::Address::Ipv6Instance>(sa6_local);
+
+  // Create an IPv6 remote address.
+  sockaddr_in6 sa6_remote;
+  memset(&sa6_remote, 0, sizeof(sa6_remote));
+  sa6_remote.sin6_family = AF_INET6;
+  sa6_remote.sin6_port = htons(80);
+  inet_pton(AF_INET6, "2001:db8::1", &sa6_remote.sin6_addr);
+  auto v6_remote_addr = std::make_shared<Network::Address::Ipv6Instance>(sa6_remote);
+
+  quic_connection_->connectionSocket()->connectionInfoProvider().setLocalAddress(
+      scoped_v6_local_addr);
+  quic_connection_->connectionSocket()->connectionInfoProvider().setRemoteAddress(v6_remote_addr);
+
+  // SPELLCHECKER(off)
+  // Trigger port migration. Under the vulnerable implementation, this will throw an EnvoyException
+  // (invalid ipv6 address 'fe80::1%1') and fail the test.
+  // SPELLCHECKER(on)
+  EXPECT_NO_THROW(quic_connection_->OnPathDegradingDetected());
 }
 } // namespace Quic
 } // namespace Envoy

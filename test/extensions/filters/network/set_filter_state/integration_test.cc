@@ -124,15 +124,16 @@ public:
           filter_chain->mutable_transport_socket()->mutable_typed_config()->UnpackTo(&tls_context);
       RELEASE_ASSERT(unpack_ok, "failed to unpack DownstreamTlsContext for test listener");
       tls_context.mutable_require_client_certificate()->set_value(true);
-      filter_chain->mutable_transport_socket()->mutable_typed_config()->PackFrom(tls_context);
+      std::ignore =
+          filter_chain->mutable_transport_socket()->mutable_typed_config()->PackFrom(tls_context);
     });
 
     BaseIntegrationTest::initialize();
   }
 
   Network::ClientConnectionPtr makeTlsClientConnection() {
-    auto client_transport_socket_factory =
-        Ssl::createClientSslTransportSocketFactory(/*options=*/{}, context_manager_, *api_);
+    auto client_transport_socket_factory = Ssl::createClientSslTransportSocketFactory(
+        /*options=*/{}, context_manager_, *api_, &server_factory_context_.serverScope());
     auto address = Ssl::getSslAddress(version_, lookupPort("listener_0"));
     return dispatcher_->createClientConnection(
         address, Network::Address::InstanceConstSharedPtr(),

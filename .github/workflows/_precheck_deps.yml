@@ -5,10 +5,9 @@ permissions:
 
 on:
   workflow_call:
+    secrets:
+      dockerhub-token:
     inputs:
-      dependency-review:
-        type: boolean
-        default: false
       request:
         type: string
         required: true
@@ -23,6 +22,8 @@ concurrency:
 
 jobs:
   deps:
+    secrets:
+      dockerhub-token: ${{ secrets.dockerhub-token }}
     permissions:
       actions: read
       contents: read
@@ -30,15 +31,18 @@ jobs:
     uses: ./.github/workflows/_run.yml
     name: ${{ matrix.target }}
     with:
-      bazel-cache: true
       bazel-extra: '--config=rbe'
       cache-build-image: ${{ fromJSON(inputs.request).request.build-image.default }}
       concurrency-suffix: -${{ matrix.target }}
+      docker-ci: false
       request: ${{ inputs.request }}
+      uploads: ${{ matrix.uploads }}
       error-match: |
         ERROR
         error:
         Error:
+        FAILED
+        FAIL:
       rbe: true
       target: ${{ matrix.target }}
       trusted: ${{ inputs.trusted }}
@@ -46,15 +50,5 @@ jobs:
       matrix:
         include:
         - target: deps
-
-  dependency-review:
-    runs-on: ubuntu-24.04
-    if: ${{ inputs.dependency-review }}
-    steps:
-    - name: Checkout Repository
-      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
-      with:
-        ref: ${{ fromJSON(inputs.request).request.sha }}
-        persist-credentials: false
-    - name: Dependency Review
-      uses: actions/dependency-review-action@2031cfc080254a8a887f58cffee85186f0e49e48  # v4.9.0
+          uploads: |
+            fix_lockfiles.diff: /home/runner/work/_temp/container/fix_lockfiles.diff

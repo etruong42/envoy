@@ -36,7 +36,6 @@ Network::FilterStatus OriginalDstFilter::onAccept(Network::ListenerFilterCallbac
       if constexpr (Platform::win32SupportsOriginalDestination()) {
         if (traffic_direction_ == envoy::config::core::v3::OUTBOUND) {
           ENVOY_LOG(debug, "[Windows] Querying for redirect record for outbound listener");
-          unsigned long redirectRecordsSize = 0;
           auto redirect_records = std::make_shared<Network::Win32RedirectRecords>();
           auto status = socket.ioctl(SIO_QUERY_WFP_CONNECTION_REDIRECT_RECORDS, NULL, 0,
                                      redirect_records->buf_, sizeof(redirect_records->buf_),
@@ -55,7 +54,6 @@ Network::FilterStatus OriginalDstFilter::onAccept(Network::ListenerFilterCallbac
           if (!has_options) {
             filter_state.setData(Network::UpstreamSocketOptionsFilterState::key(),
                                  std::make_unique<Network::UpstreamSocketOptionsFilterState>(),
-                                 StreamInfo::FilterState::StateType::Mutable,
                                  StreamInfo::FilterState::LifeSpan::Connection);
           }
           filter_state

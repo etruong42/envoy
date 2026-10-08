@@ -36,7 +36,7 @@ void createLuaTableFromStringList(lua_State* state, const StringList& list) {
 // (https://github.com/LuaJIT/LuaJIT/blob/8271c643c21d1b2f344e339f559f2de6f3663191/src/luaconf.h#L104),
 // which is large enough to hold timestamp-since-epoch in seconds. Note: In Lua, we usually use
 // os.time(os.date("!*t")) to get current timestamp-since-epoch in seconds.
-int64_t timestampInSeconds(const absl::optional<SystemTime>& system_time) {
+int64_t timestampInSeconds(const std::optional<SystemTime>& system_time) {
   return system_time.has_value() ? std::chrono::duration_cast<std::chrono::seconds>(
                                        system_time.value().time_since_epoch())
                                        .count()
@@ -391,7 +391,7 @@ int SslConnectionWrapper::luaCiphersuiteId(lua_State* state) {
 }
 
 int SslConnectionWrapper::luaCiphersuiteString(lua_State* state) {
-  const std::string& cipher_suite = connection_info_.ciphersuiteString();
+  const absl::string_view cipher_suite = connection_info_.ciphersuiteString();
   lua_pushlstring(state, cipher_suite.data(), cipher_suite.size());
   return 1;
 }

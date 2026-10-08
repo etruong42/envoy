@@ -7,7 +7,7 @@
 
 use envoy_proxy_dynamic_modules_rust_sdk::*;
 use std::fmt::Write;
-use std::net::{SocketAddr, ToSocketAddrs};
+use std::net::ToSocketAddrs;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -80,8 +80,8 @@ struct DnsOverHttpsJsonConfig {
 }
 
 impl HickoryConfig {
-  fn effective_cache_size(&self) -> usize {
-    self.cache_size.unwrap_or(1024) as usize
+  fn effective_cache_size(&self) -> u64 {
+    self.cache_size.unwrap_or(1024) as u64
   }
 
   fn effective_num_threads(&self) -> usize {
@@ -139,14 +139,14 @@ impl DnsResolverConfig for HickoryDnsResolverConfigImpl {
   fn new_resolver(
     &self,
     envoy_callback: Arc<dyn EnvoyDnsResolverCallback>,
-  ) -> Box<dyn DnsResolverInstance> {
-    let resolver = HickoryDnsResolverImpl::new(&self.config, envoy_callback);
-    Box::new(resolver)
+  ) -> Option<Box<dyn DnsResolverInstance>> {
+    let resolver = HickoryDnsResolverImpl::new(&self.config, envoy_callback)?;
+    Some(Box::new(resolver))
   }
 }
 
 type TokioResolver =
-  hickory_resolver::Resolver<hickory_resolver::name_server::TokioConnectionProvider>;
+  hickory_resolver::Resolver<hickory_resolver::net::runtime::TokioRuntimeProvider>;
 
 // Compile-time verification that TokioResolver implements Send + Sync.
 // This lets the compiler auto-derive Send + Sync for SharedResolverState and
@@ -186,47 +186,64 @@ impl Drop for HickoryDnsResolverImpl {
 }
 
 impl HickoryDnsResolverImpl {
-  fn new(config: &HickoryConfig, envoy_callback: Arc<dyn EnvoyDnsResolverCallback>) -> Self {
-    let runtime = tokio::runtime::Builder::new_multi_thread()
+  fn new(
+    config: &HickoryConfig,
+    envoy_callback: Arc<dyn EnvoyDnsResolverCallback>,
+  ) -> Option<Self> {
+    // A runtime or resolver build failure is recoverable, for example under resource exhaustion, so
+    // return None and let Envoy reject the configuration rather than aborting the whole process.
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
       .worker_threads(config.effective_num_threads())
       .thread_name("hickory-dns")
       .enable_all()
       .build()
-      .expect("failed to create Tokio runtime for Hickory DNS");
+    {
+      Ok(runtime) => runtime,
+      Err(e) => {
+        envoy_log_error!("hickory DNS: failed to create Tokio runtime: {e}");
+        return None;
+      },
+    };
 
-    let resolver = runtime.block_on(async { build_resolver(config) });
+    let resolver = match runtime.block_on(async { build_resolver(config) }) {
+      Ok(resolver) => resolver,
+      Err(e) => {
+        envoy_log_error!("hickory DNS: {e}");
+        return None;
+      },
+    };
 
-    HickoryDnsResolverImpl {
+    Some(HickoryDnsResolverImpl {
       runtime: Some(runtime),
       shared: Arc::new(SharedResolverState {
         resolver,
         envoy_callback,
         shutting_down: AtomicBool::new(false),
       }),
-    }
+    })
   }
 }
 
-fn build_resolver(config: &HickoryConfig) -> TokioResolver {
+fn build_resolver(config: &HickoryConfig) -> Result<TokioResolver, String> {
   use hickory_resolver::config::*;
-  use hickory_resolver::name_server::TokioConnectionProvider;
-  use hickory_resolver::proto::xfer::Protocol;
 
   let mut resolver_config = if config.should_use_system_config() {
     let (sys_config, _) = hickory_resolver::system_conf::read_system_conf()
       .unwrap_or_else(|_| (ResolverConfig::default(), ResolverOpts::default()));
     sys_config
   } else {
-    ResolverConfig::new()
+    ResolverConfig::default()
   };
 
   for resolver_addr in &config.resolvers {
     if let Some(ref sa) = resolver_addr.socket_address {
       let port = sa.port_value.unwrap_or(53) as u16;
       if let Ok(ip) = sa.address.parse::<std::net::IpAddr>() {
-        let socket_addr = SocketAddr::new(ip, port);
-        resolver_config.add_name_server(NameServerConfig::new(socket_addr, Protocol::Udp));
-        resolver_config.add_name_server(NameServerConfig::new(socket_addr, Protocol::Tcp));
+        let mut udp = ConnectionConfig::udp();
+        udp.port = port;
+        let mut tcp = ConnectionConfig::tcp();
+        tcp.port = port;
+        resolver_config.add_name_server(NameServerConfig::new(ip, true, vec![udp, tcp]));
       }
     }
   }
@@ -236,10 +253,10 @@ fn build_resolver(config: &HickoryConfig) -> TokioResolver {
       if let Some(ref sa) = server.socket_address {
         let port = sa.port_value.unwrap_or(853) as u16;
         if let Ok(ip) = sa.address.parse::<std::net::IpAddr>() {
-          let socket_addr = SocketAddr::new(ip, port);
-          let mut ns = NameServerConfig::new(socket_addr, Protocol::Tls);
-          ns.tls_dns_name = Some(dot_config.tls_server_name.clone());
-          resolver_config.add_name_server(ns);
+          let mut tls_conn =
+            ConnectionConfig::tls(std::sync::Arc::from(dot_config.tls_server_name.as_str()));
+          tls_conn.port = port;
+          resolver_config.add_name_server(NameServerConfig::new(ip, true, vec![tls_conn]));
         }
       }
     }
@@ -267,13 +284,14 @@ fn build_resolver(config: &HickoryConfig) -> TokioResolver {
             Err(_) => continue,
           }
         };
-        let socket_addr = SocketAddr::new(ip, port);
-        let mut ns = NameServerConfig::new(socket_addr, Protocol::Https);
-        ns.tls_dns_name = Some(host.to_string());
-        if path != "/" && !path.is_empty() {
-          ns.http_endpoint = Some(path.to_string());
-        }
-        resolver_config.add_name_server(ns);
+        let path_opt = if path != "/" && !path.is_empty() {
+          Some(std::sync::Arc::from(path))
+        } else {
+          None
+        };
+        let mut https_conn = ConnectionConfig::https(std::sync::Arc::from(host), path_opt);
+        https_conn.port = port;
+        resolver_config.add_name_server(NameServerConfig::new(ip, true, vec![https_conn]));
       }
     }
   }
@@ -284,10 +302,12 @@ fn build_resolver(config: &HickoryConfig) -> TokioResolver {
   opts.cache_size = config.effective_cache_size();
   opts.validate = config.enable_dnssec;
 
-  let provider = TokioConnectionProvider::default();
+  let provider = hickory_resolver::net::runtime::TokioRuntimeProvider::default();
   let mut builder = hickory_resolver::Resolver::builder_with_config(resolver_config, provider);
   *builder.options_mut() = opts;
-  builder.build()
+  builder
+    .build()
+    .map_err(|e| format!("failed to build DNS resolver: {e}"))
 }
 
 impl DnsResolverInstance for HickoryDnsResolverImpl {
@@ -411,17 +431,18 @@ async fn perform_lookup(
 
 /// Extract A records from a lookup result into the addresses vector.
 fn collect_a_records(
-  result: Result<hickory_resolver::lookup::Lookup, hickory_resolver::ResolveError>,
+  result: Result<hickory_resolver::lookup::Lookup, hickory_resolver::net::NetError>,
   addresses: &mut Vec<DnsAddress>,
   error_msg: &mut Option<String>,
 ) {
+  use hickory_resolver::proto::rr::RData;
   match result {
     Ok(response) => {
-      for record in response.records() {
-        if let Some(a) = record.data().as_a() {
+      for record in response.answers() {
+        if let RData::A(a) = &record.data {
           addresses.push(DnsAddress {
             address: format_ipv4_address(a.0),
-            ttl_seconds: record.ttl(),
+            ttl_seconds: record.ttl,
           });
         }
       }
@@ -432,17 +453,18 @@ fn collect_a_records(
 
 /// Extract AAAA records from a lookup result into the addresses vector.
 fn collect_aaaa_records(
-  result: Result<hickory_resolver::lookup::Lookup, hickory_resolver::ResolveError>,
+  result: Result<hickory_resolver::lookup::Lookup, hickory_resolver::net::NetError>,
   addresses: &mut Vec<DnsAddress>,
   error_msg: &mut Option<String>,
 ) {
+  use hickory_resolver::proto::rr::RData;
   match result {
     Ok(response) => {
-      for record in response.records() {
-        if let Some(aaaa) = record.data().as_aaaa() {
+      for record in response.answers() {
+        if let RData::AAAA(aaaa) = &record.data {
           addresses.push(DnsAddress {
             address: format_ipv6_address(aaaa.0),
-            ttl_seconds: record.ttl(),
+            ttl_seconds: record.ttl,
           });
         }
       }
@@ -454,7 +476,7 @@ fn collect_aaaa_records(
 fn append_lookup_error(
   error_msg: &mut Option<String>,
   record_type: &str,
-  error: &hickory_resolver::ResolveError,
+  error: &hickory_resolver::net::NetError,
 ) {
   let msg = format!("{record_type} lookup failed: {error}");
   match error_msg {

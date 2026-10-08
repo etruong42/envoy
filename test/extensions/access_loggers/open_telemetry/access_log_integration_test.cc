@@ -2,6 +2,7 @@
 #include "envoy/extensions/access_loggers/grpc/v3/als.pb.h"
 #include "envoy/extensions/access_loggers/open_telemetry/v3/logs_service.pb.h"
 #include "envoy/extensions/filters/network/http_connection_manager/v3/http_connection_manager.pb.h"
+#include "envoy/extensions/tracers/opentelemetry/resource_detectors/v3/environment_resource_detector.pb.h"
 
 #include "source/common/buffer/zero_copy_input_stream_impl.h"
 #include "source/common/grpc/codec.h"
@@ -10,6 +11,7 @@
 
 #include "test/common/grpc/grpc_client_integration.h"
 #include "test/integration/http_integration.h"
+#include "test/test_common/environment.h"
 #include "test/test_common/utility.h"
 
 #include "absl/strings/match.h"
@@ -17,6 +19,7 @@
 #include "opentelemetry/proto/collector/logs/v1/logs_service.pb.h"
 
 using testing::AssertionResult;
+using testing::Eq;
 
 constexpr char EXPECTED_REQUEST_MESSAGE[] = R"EOF(
     resource_logs:
@@ -34,6 +37,9 @@ constexpr char EXPECTED_REQUEST_MESSAGE[] = R"EOF(
           - key: "node_name"
             value:
               string_value: "node_name"
+          - key: "service.name"
+            value:
+              string_value: "my-service"
       scope_logs:
         - log_records:
             body:
@@ -73,6 +79,7 @@ public:
       : HttpIntegrationTest(Http::CodecType::HTTP1, std::get<0>(GetParam())) {
     skip_tag_extraction_rule_check_ = true;
     driver_ = (std::get<2>(GetParam()) == ExporterType::GRPC) ? makeGrpcDriver() : makeHttpDriver();
+    TestEnvironment::setEnvVar("OTEL_RESOURCE_ATTRIBUTES", "service.name=my-service", 1);
   }
 
   Network::Address::IpVersion ipVersion() const override { return std::get<0>(GetParam()); }
@@ -101,6 +108,11 @@ public:
           envoy::extensions::access_loggers::open_telemetry::v3::OpenTelemetryAccessLogConfig
               config;
           config.set_log_name("foo");
+          auto* detector = config.add_resource_detectors();
+          detector->set_name("envoy.tracers.opentelemetry.resource_detectors.environment");
+          envoy::extensions::tracers::opentelemetry::resource_detectors::v3::
+              EnvironmentResourceDetectorConfig env_config;
+          std::ignore = detector->mutable_typed_config()->PackFrom(env_config);
           driver_.configureExporter(config, fake_upstreams_.back()->localAddress());
           auto* body_config = config.mutable_body();
           body_config->set_string_value("%REQ(:METHOD)% %PROTOCOL% %RESPONSE_CODE%");
@@ -108,7 +120,7 @@ public:
           auto* value = attr_config->add_values();
           value->set_key("response_code_details");
           value->mutable_value()->set_string_value("%RESPONSE_CODE_DETAILS%");
-          access_log->mutable_typed_config()->PackFrom(config);
+          std::ignore = access_log->mutable_typed_config()->PackFrom(config);
         });
 
     HttpIntegrationTest::initialize();
@@ -248,6 +260,9 @@ TEST_P(AccessLogIntegrationTest, AccessLoggerStatsAreIndependentOfListener) {
           - key: "node_name"
             value:
               string_value: "node_name"
+          - key: "service.name"
+            value:
+              string_value: "my-service"
       scope_logs:
         - log_records:
             body:
@@ -277,7 +292,7 @@ TEST_P(AccessLogIntegrationTest, AccessLoggerStatsAreIndependentOfListener) {
         });
     new_config_helper.setLds("1");
     ASSERT_TRUE(codec_client_->waitForDisconnect());
-    test_server_->waitForGaugeEq("listener_manager.total_listeners_active", 1);
+    test_server_->waitForGauge("listener_manager.total_listeners_active", Eq(1));
   }
 
   // Make another request, the existing access logger should be used.
@@ -290,7 +305,7 @@ TEST_P(AccessLogIntegrationTest, AccessLoggerStatsAreIndependentOfListener) {
   codec_client_->close();
   cleanup();
 
-  test_server_->waitForCounterEq("access_logs.open_telemetry_access_log.logs_written", 2);
+  test_server_->waitForCounter("access_logs.open_telemetry_access_log.logs_written", Eq(2));
 }
 
 class AccessLogFormatterHeaderTest : public testing::TestWithParam<Network::Address::IpVersion>,
@@ -337,7 +352,7 @@ public:
 
           auto* body_config = config.mutable_body();
           body_config->set_string_value("%REQ(:METHOD)% %PROTOCOL% %RESPONSE_CODE%");
-          access_log->mutable_typed_config()->PackFrom(config);
+          std::ignore = access_log->mutable_typed_config()->PackFrom(config);
         });
 
     HttpIntegrationTest::initialize();

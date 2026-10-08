@@ -20,8 +20,9 @@
 #include "source/common/config/utility.h"
 #include "source/common/json/json_loader.h"
 #include "source/common/protobuf/message_validator_impl.h"
+#include "source/common/runtime/runtime_features.h"
 #include "source/common/stats/symbol_table.h"
-#include "source/common/tls/aws_lc_compat.h"
+#include "source/common/tls/cert_validator/default_validator.h"
 #include "source/common/tls/cert_validator/factory.h"
 #include "source/common/tls/stats.h"
 #include "source/common/tls/utility.h"
@@ -92,7 +93,7 @@ parseTrustBundles(absl::string_view trust_bundle_mapping_str) {
                 return false;
               }
               const auto& certs = key->getStringArray("x5c");
-              if (!certs.ok() || (*certs).size() == 0) {
+              if (!certs.ok() || (*certs).empty()) {
                 parsing_status = absl::InvalidArgumentError(fmt::format(
                     "missing or empty 'x5c' field found in keys for domain: '{}'", domain_name));
                 return false;
@@ -147,6 +148,7 @@ SPIFFEValidator::SPIFFEValidator(const Envoy::Ssl::CertificateValidationContextC
     : stats_(stats), time_source_(context.timeSource()) {
   ASSERT(config != nullptr);
   allow_expired_certificate_ = config->allowExpiredCertificate();
+  suppress_client_ca_list_ = config->suppressClientCaList();
 
   SPIFFEConfig message;
   SET_AND_RETURN_IF_NOT_OK(Config::Utility::translateOpaqueConfig(
@@ -162,7 +164,10 @@ SPIFFEValidator::SPIFFEValidator(const Envoy::Ssl::CertificateValidationContextC
         // SAN types. See the discussion: https://github.com/envoyproxy/envoy/issues/15392
         // TODO(pradeepcrao): Throw an exception when a non-URI matcher is encountered after the
         // deprecated field match_subject_alt_names is removed
-        subject_alt_name_matchers_.emplace_back(createStringSanMatcher(matcher, context));
+        auto status_or_matcher = createStringSanMatcher(matcher, context);
+        SET_AND_RETURN_IF_NOT_OK(status_or_matcher.status(), creation_status);
+
+        subject_alt_name_matchers_.emplace_back(std::move(*status_or_matcher));
       }
     }
   }
@@ -219,9 +224,6 @@ SPIFFEValidator::SPIFFEValidator(const Envoy::Ssl::CertificateValidationContextC
         spiffe_data_->ca_certs_.push_back(bssl::UniquePtr<X509>(item->x509));
         X509_up_ref(item->x509);
         if (!ca_loaded) {
-          // TODO: With the current interface, we cannot return the multiple
-          // cert information on getCaCertInformation method.
-          // So temporarily we return the first CA's info here.
           ca_loaded = true;
           ca_file_name_ = absl::StrCat(domain.name(), ": ",
                                        domain.trust_bundle().filename().empty()
@@ -246,6 +248,14 @@ SPIFFEValidator::SPIFFEValidator(const Envoy::Ssl::CertificateValidationContextC
 }
 
 absl::Status SPIFFEValidator::addClientValidationContext(SSL_CTX* ctx, bool) {
+  // When suppressed, CAs are still used for validation (loaded via the trust bundle
+  // in initializeSslContexts) but their names are not advertised in the TLS
+  // CertificateRequest. Skip building the name stack entirely — this is the common
+  // case for deployments with very large CA sets.
+  if (suppress_client_ca_list_) {
+    return absl::OkStatus();
+  }
+
   // Use a generic lambda to be compatible with BoringSSL before and after
   // https://boringssl-review.googlesource.com/c/boringssl/+/56190
   bssl::UniquePtr<STACK_OF(X509_NAME)> list(
@@ -282,6 +292,13 @@ void SPIFFEValidator::updateDigestForSessionId(bssl::ScopedEVP_MD_CTX& md,
     rc = EVP_DigestUpdate(md.get(), hash_buffer, hash_length);
     RELEASE_ASSERT(rc == 1, Utility::getLastCryptoError().value_or(""));
   }
+  // Only hash when the flag is enabled, so session IDs for existing deployments
+  // (where the flag defaults to false) stay byte-identical to pre-feature behavior.
+  if (suppress_client_ca_list_) {
+    bool suppress = true;
+    rc = EVP_DigestUpdate(md.get(), &suppress, sizeof(suppress));
+    RELEASE_ASSERT(rc == 1, Utility::getLastCryptoError().value_or(""));
+  }
 }
 
 absl::StatusOr<int> SPIFFEValidator::initializeSslContexts(std::vector<SSL_CTX*>, bool,
@@ -291,8 +308,8 @@ absl::StatusOr<int> SPIFFEValidator::initializeSslContexts(std::vector<SSL_CTX*>
 
 bool SPIFFEValidator::verifyCertChainUsingTrustBundleStore(
     X509& leaf_cert, STACK_OF(X509)* cert_chain, X509_VERIFY_PARAM* verify_param,
-    absl::string_view workload_trust_domain, std::string& error_details,
-    std::vector<bssl::UniquePtr<X509>>& validated_chain) {
+    absl::string_view workload_trust_domain, absl::Span<const std::string> verify_san_list,
+    std::string& error_details, std::vector<bssl::UniquePtr<X509>>& validated_chain) {
   if (!SPIFFEValidator::certificatePrecheck(&leaf_cert)) {
     error_details = "verify cert failed: cert precheck";
     stats_.fail_verify_error_.inc();
@@ -335,12 +352,25 @@ bool SPIFFEValidator::verifyCertChainUsingTrustBundleStore(
   }
 
   // Do SAN matching.
-  const bool san_match = subject_alt_name_matchers_.empty() ? true : matchSubjectAltName(leaf_cert);
-  if (!san_match) {
-    error_details = "verify cert failed: SAN match";
-    stats_.fail_verify_san_.inc();
+  if (!verify_san_list.empty()) {
+    bool san_match = DefaultCertValidator::verifySubjectAltName(&leaf_cert, verify_san_list);
+    if (!san_match) {
+      error_details =
+          absl::StrCat("verify cert failed: URI SAN peer identity mismatches, expected SANs: ",
+                       absl::StrJoin(verify_san_list, ", "));
+      stats_.fail_verify_san_.inc();
+      return false;
+    }
   }
-  return san_match;
+  if (!subject_alt_name_matchers_.empty()) {
+    bool san_match = matchSubjectAltName(leaf_cert);
+    if (!san_match) {
+      error_details = "verify cert failed: SAN match";
+      stats_.fail_verify_san_.inc();
+      return false;
+    }
+  }
+  return true;
 }
 
 constexpr absl::string_view WorkloadTrustDomainKey =
@@ -354,11 +384,12 @@ ValidationResults SPIFFEValidator::doVerifyCertChain(
   if (sk_X509_num(&cert_chain) == 0) {
     stats_.fail_verify_error_.inc();
     return {ValidationResults::ValidationStatus::Failed,
-            Envoy::Ssl::ClientValidationStatus::NotValidated, absl::nullopt,
+            Envoy::Ssl::ClientValidationStatus::NotValidated, std::nullopt,
             "verify cert failed: empty cert chain"};
   }
   X509* leaf_cert = sk_X509_value(&cert_chain, 0);
   const Router::StringAccessor* obj = nullptr;
+  absl::Span<const std::string> verify_san_list;
   if (is_server) {
     if (auto* cb = validation_context.callbacks; cb) {
       const StreamInfo::StreamInfo& info = cb->connection().streamInfo();
@@ -372,19 +403,23 @@ ValidationResults SPIFFEValidator::doVerifyCertChain(
           break;
         }
       }
+      if (Runtime::runtimeFeatureEnabled(
+              "envoy.reloadable_features.spiffe_validator_use_upstream_subject_alt_names")) {
+        verify_san_list = transport_socket_options->verifySubjectAltNameListOverride();
+      }
     }
   }
   absl::string_view workload_trust_domain = obj ? obj->asString() : "";
   std::string error_details;
   std::vector<bssl::UniquePtr<X509>> validated_chain;
-  bool verified =
-      verifyCertChainUsingTrustBundleStore(*leaf_cert, &cert_chain, SSL_CTX_get0_param(&ssl_ctx),
-                                           workload_trust_domain, error_details, validated_chain);
+  bool verified = verifyCertChainUsingTrustBundleStore(
+      *leaf_cert, &cert_chain, SSL_CTX_get0_param(&ssl_ctx), workload_trust_domain, verify_san_list,
+      error_details, validated_chain);
   return verified ? ValidationResults{ValidationResults::ValidationStatus::Successful,
-                                      Envoy::Ssl::ClientValidationStatus::Validated, absl::nullopt,
-                                      absl::nullopt, std::move(validated_chain)}
+                                      Envoy::Ssl::ClientValidationStatus::Validated, std::nullopt,
+                                      std::nullopt, std::move(validated_chain)}
                   : ValidationResults{ValidationResults::ValidationStatus::Failed,
-                                      Envoy::Ssl::ClientValidationStatus::Failed, absl::nullopt,
+                                      Envoy::Ssl::ClientValidationStatus::Failed, std::nullopt,
                                       error_details};
 }
 
@@ -489,16 +524,16 @@ void SPIFFEValidator::initializeCertExpirationStats(Stats::Scope& scope,
   }
 }
 
-absl::optional<uint32_t> SPIFFEValidator::daysUntilFirstCertExpires() const {
+std::optional<uint32_t> SPIFFEValidator::daysUntilFirstCertExpires() const {
   auto spiffe_data = getSpiffeData();
   if (spiffe_data->ca_certs_.empty()) {
-    return absl::make_optional(std::numeric_limits<uint32_t>::max());
+    return std::make_optional(std::numeric_limits<uint32_t>::max());
   }
-  absl::optional<uint32_t> ret = absl::make_optional(std::numeric_limits<uint32_t>::max());
+  std::optional<uint32_t> ret = std::make_optional(std::numeric_limits<uint32_t>::max());
   for (auto& cert : spiffe_data->ca_certs_) {
-    const absl::optional<uint32_t> tmp = Utility::getDaysUntilExpiration(cert.get(), time_source_);
+    const std::optional<uint32_t> tmp = Utility::getDaysUntilExpiration(cert.get(), time_source_);
     if (!tmp.has_value()) {
-      return absl::nullopt;
+      return std::nullopt;
     } else if (tmp.value() < ret.value()) {
       ret = tmp;
     }
@@ -506,15 +541,13 @@ absl::optional<uint32_t> SPIFFEValidator::daysUntilFirstCertExpires() const {
   return ret;
 }
 
-Envoy::Ssl::CertificateDetailsPtr SPIFFEValidator::getCaCertInformation() const {
+std::vector<Envoy::Ssl::CertificateDetailsPtr> SPIFFEValidator::getCaCertInformation() const {
   auto spiffe_data = getSpiffeData();
-  if (spiffe_data->ca_certs_.empty()) {
-    return nullptr;
+  std::vector<Envoy::Ssl::CertificateDetailsPtr> ca_details;
+  for (const auto& cert : spiffe_data->ca_certs_) {
+    ca_details.push_back(Utility::certificateDetails(cert.get(), getCaFileName(), time_source_));
   }
-  // TODO(mathetake): With the current interface, we cannot pass the multiple cert information.
-  // So temporarily we return the first CA's info here.
-  return Utility::certificateDetails(spiffe_data->ca_certs_[0].get(), getCaFileName(),
-                                     time_source_);
+  return ca_details;
 };
 
 class SPIFFEValidatorFactory : public CertValidatorFactory {

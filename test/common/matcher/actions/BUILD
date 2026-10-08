@@ -11,12 +11,11 @@ envoy_package()
 envoy_cc_test(
     name = "string_returning_action_test",
     srcs = ["string_returning_action_test.cc"],
-    rbe_pool = "6gig",
+    rbe_pool = "linux_x64_small",
     deps = [
-        # formatter_extension_lib is required for DYNAMIC_METADATA to function in test.
         "//source/common/formatter:formatter_extension_lib",
         "//source/common/matcher/actions:string_returning_action_lib",
+        "//test/mocks/server:server_factory_context_mocks",
         "//test/test_common:utility_lib",
-        "//test/mocks/server:instance_mocks",
     ],
 )

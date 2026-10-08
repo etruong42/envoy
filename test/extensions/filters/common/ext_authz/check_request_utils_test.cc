@@ -23,6 +23,9 @@ using testing::Return;
 using testing::ReturnPointee;
 using testing::ReturnRef;
 
+using testing::Contains;
+using testing::Key;
+
 namespace Envoy {
 namespace Extensions {
 namespace Filters {
@@ -169,7 +172,7 @@ public:
   }
 
   Network::Address::InstanceConstSharedPtr addr_;
-  absl::optional<Http::Protocol> protocol_;
+  std::optional<Http::Protocol> protocol_;
   CheckRequestUtils check_request_generator_;
   NiceMock<Envoy::Http::MockStreamDecoderFilterCallbacks> callbacks_;
   NiceMock<Envoy::Network::MockReadFilterCallbacks> net_callbacks_;
@@ -357,11 +360,11 @@ TEST_F(CheckRequestUtilsTest, BasicHttpWithRequestHeaderAllowlist) {
   EXPECT_EQ(buffer_->toString().substr(0, size), request_.attributes().request().http().body());
   EXPECT_FALSE(request_.attributes().request().http().has_header_map());
 
-  EXPECT_TRUE(request_.attributes().request().http().headers().contains("allowed"));
+  EXPECT_THAT(request_.attributes().request().http().headers(), Contains(Key("allowed")));
   EXPECT_EQ("allowed value", request_.attributes().request().http().headers().at("allowed"));
 
   // No denylist was used.
-  EXPECT_TRUE(request_.attributes().request().http().headers().contains("allowed-dupe"));
+  EXPECT_THAT(request_.attributes().request().http().headers(), Contains(Key("allowed-dupe")));
   EXPECT_EQ("one,two", request_.attributes().request().http().headers().at("allowed-dupe"));
 
   EXPECT_FALSE(request_.attributes().request().http().headers().contains("not-allowed"));
@@ -641,7 +644,6 @@ TEST_F(CheckRequestUtilsTest, HeadersAsBytesExistingPartialBodyHeader) {
 TEST_F(CheckRequestUtilsTest, CheckAttrContextPeer) {
   Http::TestRequestHeaderMapImpl request_headers{{"x-envoy-downstream-service-cluster", "foo"},
                                                  {":path", "/bar"}};
-  envoy::service::auth::v3::CheckRequest request;
   EXPECT_CALL(callbacks_, connection())
       .Times(2)
       .WillRepeatedly(Return(OptRef<const Network::Connection>{connection_}));

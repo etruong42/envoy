@@ -63,7 +63,7 @@ envoy_cc_library(
     name = "server_lib",
     srcs = ["server.cc"],
     hdrs = ["server.h"],
-    rbe_pool = "6gig",
+    rbe_pool = "linux_x64_small",
     deps = [
         ":admin_lib",
         ":api_lib",
@@ -98,7 +98,6 @@ envoy_cc_library(
         "//source/server:server_lib",
         "//source/server:utils_lib",
         "//source/server/admin:admin_factory_context",
-        "@abseil-cpp//absl/types:optional",
         "@envoy_api//envoy/config/bootstrap/v3:pkg_cc_proto",
         "@envoy_api//envoy/config/core/v3:pkg_cc_proto",
         "@envoy_api//envoy/config/listener/v3:pkg_cc_proto",

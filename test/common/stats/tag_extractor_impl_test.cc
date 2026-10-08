@@ -174,6 +174,14 @@ TEST(TagExtractorTest, DefaultTagExtractors) {
   regex_tester.testRegex("cluster.ratelimit.upstream_rq_timeout", "cluster.upstream_rq_timeout",
                          {cluster_tag});
 
+  // Health check name
+  Tag health_check_tag;
+  health_check_tag.name_ = tag_names.HEALTH_CHECK_NAME;
+  health_check_tag.value_ = "hc";
+
+  regex_tester.testRegex("cluster.ratelimit.health_check.name.hc.attempt",
+                         "cluster.health_check.attempt", {cluster_tag, health_check_tag});
+
   // Listener SSL
   Tag listener_address;
   listener_address.name_ = tag_names.LISTENER_ADDRESS;
@@ -313,6 +321,14 @@ TEST(TagExtractorTest, DefaultTagExtractors) {
 
   regex_tester.testRegex("cluster.grpc_cluster.grpc.grpc_service_1.grpc_method_1.success",
                          "cluster.grpc.success", {grpc_cluster, grpc_method, grpc_service});
+
+  // Google gRPC client stats: grpc.(<client_prefix>.)<base_stat>
+  Tag google_grpc_prefix;
+  google_grpc_prefix.name_ = tag_names.GOOGLE_GRPC_CLIENT_PREFIX;
+  google_grpc_prefix.value_ = "metrics_service";
+
+  regex_tester.testRegex("grpc.metrics_service.streams_closed_14", "grpc.streams_closed_14",
+                         {google_grpc_prefix});
 
   // Virtual host and cluster
   Tag vhost;

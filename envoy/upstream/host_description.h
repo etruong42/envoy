@@ -45,7 +45,8 @@ using MetadataConstSharedPtr = std::shared_ptr<const envoy::config::core::v3::Me
   COUNTER(rq_timeout)                                                                              \
   COUNTER(rq_total)                                                                                \
   GAUGE(cx_active)                                                                                 \
-  GAUGE(rq_active)
+  GAUGE(rq_active)                                                                                 \
+  GAUGE(rq_pending_active)
 
 /**
  * All per host stats defined. @see stats_macros.h
@@ -113,10 +114,11 @@ public:
    * Please ensure that the implementation is thread-safe.
    *
    * @param report supplies the ORCA load report of this upstream host.
-   * @param stream_info supplies the downstream stream info.
+   * @param stream_info carries the downstream stream info for in-band reports and is empty for
+   *        out-of-band (OOB) reports.
    */
   virtual absl::Status onOrcaLoadReport(const OrcaLoadReport& /*report*/,
-                                        const StreamInfo::StreamInfo& /*stream_info*/) {
+                                        OptRef<const StreamInfo::StreamInfo> /*stream_info*/) {
     return absl::OkStatus();
   }
 };
@@ -208,6 +210,15 @@ public:
   virtual const std::string& hostname() const PURE;
 
   /**
+   * @return the observability name associated with the host. Used in per-endpoint stats and other
+   * observability surfaces. This is configured with
+   * :ref:`stat_name <envoy_v3_api_field_config.endpoint.v3.Endpoint.stat_name>`. If this method
+   * returns an empty string view, then the host's address should be used as fallback for the
+   * observability name.
+   */
+  virtual absl::string_view observabilityName() const PURE;
+
+  /**
    * @return the transport socket factory responsible for this host.
    */
   virtual Network::UpstreamTransportSocketFactory& transportSocketFactory() const PURE;
@@ -264,6 +275,12 @@ public:
   virtual Network::Address::InstanceConstSharedPtr healthCheckAddress() const PURE;
 
   /**
+   * @return the address used to dial ORCA out-of-band load reporting streams
+   *         (xds.service.orca.v3.OpenRcaService).
+   */
+  virtual Network::Address::InstanceConstSharedPtr orcaReportingAddress() const PURE;
+
+  /**
    * @return the priority of the host.
    */
   virtual uint32_t priority() const PURE;
@@ -277,7 +294,7 @@ public:
    * @return timestamp of when host has transitioned from unhealthy to
    *         healthy state via an active healthchecking.
    */
-  virtual absl::optional<MonotonicTime> lastHcPassTime() const PURE;
+  virtual std::optional<MonotonicTime> lastHcPassTime() const PURE;
 
   /**
    * Set the timestamp of when the host has transitioned from unhealthy to healthy state via an
@@ -386,6 +403,12 @@ public:
    *         transport socket resolution must be done per-connection with transport_socket_options.
    */
   virtual bool usesFilterState() const PURE;
+
+  /**
+   * @return the names of the transport socket matches configured on this matcher. The returned
+   * views point at matcher-owned storage and are valid only for the duration of this call.
+   */
+  virtual std::vector<absl::string_view> matchNames() const PURE;
 };
 
 using TransportSocketMatcherPtr = std::unique_ptr<TransportSocketMatcher>;

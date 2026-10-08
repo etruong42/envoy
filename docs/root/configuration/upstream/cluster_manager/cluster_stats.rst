@@ -73,6 +73,7 @@ Every cluster has a statistics tree rooted at *cluster.<name>.* with the followi
   upstream_cx_tx_bytes_total, Counter, Total sent connection bytes
   upstream_cx_tx_bytes_buffered, Gauge, Send connection bytes currently buffered
   upstream_cx_pool_overflow, Counter, Total times that the cluster's connection pool circuit breaker overflowed
+  upstream_cx_preconnect_skipped, Counter, Total anticipatory connections not opened because the host was ineligible for preconnect
   upstream_cx_protocol_error, Counter, Total connection protocol errors
   upstream_cx_max_requests, Counter, Total connections closed due to maximum requests
   upstream_cx_none_healthy, Counter, Total times connection not established due to no healthy hosts
@@ -89,7 +90,8 @@ Every cluster has a statistics tree rooted at *cluster.<name>.* with the followi
   upstream_rq_timeout, Counter, Total requests that timed out waiting for a response
   upstream_rq_max_duration_reached, Counter, Total requests closed due to max duration reached
   upstream_rq_per_try_timeout, Counter, Total requests that hit the per try timeout (except when request hedging is enabled)
-  upstream_rq_rx_reset, Counter, Total requests that were reset remotely
+  upstream_rq_rx_reset, Counter, Total requests that were reset remotely with an error
+  upstream_rq_rx_reset_no_error, Counter, Total requests that were reset remotely with no error
   upstream_rq_tx_reset, Counter, Total requests that were reset locally
   upstream_rq_retry, Counter, Total request retries
   upstream_rq_retry_backoff_exponential, Counter, Total retries using the exponential backoff strategy

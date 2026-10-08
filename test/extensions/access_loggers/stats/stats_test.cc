@@ -9,7 +9,6 @@
 
 #include "test/common/memory/memory_test_utility.h"
 #include "test/mocks/config/mocks.h"
-#include "test/mocks/server/factory_context.h"
 #include "test/mocks/server/server_factory_context.h"
 #include "test/mocks/stats/mocks.h"
 #include "test/mocks/stream_info/mocks.h"
@@ -32,21 +31,21 @@ class MockScopeWithGauge : public Stats::MockScope {
 public:
   using Stats::MockScope::MockScope;
 
-  MOCK_METHOD(Stats::Gauge&, gaugeFromStatNameWithTags,
-              (const Stats::StatName& name, Stats::StatNameTagVectorOptConstRef tags,
-               Stats::Gauge::ImportMode import_mode),
+  MOCK_METHOD(Stats::Gauge&, gaugeFromTaggedName,
+              (Stats::StatName name, std::optional<Stats::StatNameTagSpan> name_tags,
+               Stats::StatName tagged_name, Stats::Gauge::ImportMode import_mode),
               (override));
-  MOCK_METHOD(Stats::Histogram&, histogramFromStatNameWithTags,
-              (const Stats::StatName& name, Stats::StatNameTagVectorOptConstRef tags,
-               Stats::Histogram::Unit unit),
+  MOCK_METHOD(Stats::Histogram&, histogramFromTaggedName,
+              (Stats::StatName name, std::optional<Stats::StatNameTagSpan> name_tags,
+               Stats::StatName tagged_name, Stats::Histogram::Unit unit),
               (override));
 };
 
 // MockGaugeWithTags is introduced to support iterateTagStatNames which is used in
-// AccessLogState destructor to reconstruct the gauge with tags.
+// AccessLogState destructor to reconstruct the gauge with name_tags.
 //
 // It uses StatNameDynamicStorage to own the storage for tag names and values.
-// This is necessary because the tags passed to gaugeFromStatNameWithTags during
+// This is necessary because the name_tags passed to gaugeFromTaggedName during
 // logging are often backed by temporary storage (stack-allocated in emitLogConst)
 // which is destroyed after the log call returns. By making a copy into
 // tags_storage_, we ensure that iterateTagStatNames returns valid StatNames even
@@ -57,8 +56,9 @@ public:
 
   void iterateTagStatNames(const TagStatNameIterFn& fn) const override {
     for (const auto& tag : tags_storage_) {
-      if (!fn(tag.first->statName(), tag.second->statName()))
+      if (!fn(tag.first->statName(), tag.second->statName())) {
         return;
+      }
     }
   }
 
@@ -129,32 +129,33 @@ public:
         .WillByDefault(testing::ReturnRef(store_.mockScope()));
     ON_CALL(context_, serverScope()).WillByDefault(testing::ReturnRef(store_.mockScope()));
 
-    EXPECT_CALL(store_.mockScope(), createScope_(_))
-        .WillRepeatedly(Invoke([this](const std::string& name) {
+    EXPECT_CALL(store_.mockScope(), createScope_(_, _))
+        .WillRepeatedly(Invoke([this](const std::string& name, const std::string&) {
+          // The prefix must be encoded in the same symbol table the scope resolves names
+          // with (store_), since MockScope now joins prefix() into the flat stat name.
           auto scope_name_storage =
-              std::make_unique<Stats::StatNameDynamicStorage>(name, context_.store_.symbolTable());
+              std::make_unique<Stats::StatNameDynamicStorage>(name, store_.symbolTable());
           auto scope = std::make_shared<NiceMock<MockScopeWithGauge>>(
               scope_name_storage->statName(), store_);
-          ON_CALL(*scope, gaugeFromStatNameWithTags(_, _, _))
-              .WillByDefault(
-                  Invoke([this](const Stats::StatName& name, Stats::StatNameTagVectorOptConstRef,
-                                Stats::Gauge::ImportMode import_mode) -> Stats::Gauge& {
-                    return this->store_.gauge(this->context_.store_.symbolTable().toString(name),
-                                              import_mode);
+          ON_CALL(*scope, gaugeFromTaggedName(_, _, _, _))
+              .WillByDefault(Invoke(
+                  [scope_ptr = scope.get()](Stats::StatName name,
+                                            std::optional<Stats::StatNameTagSpan> name_tags,
+                                            Stats::StatName tagged_name,
+                                            Stats::Gauge::ImportMode import_mode) -> Stats::Gauge& {
+                    return scope_ptr->Stats::MockScope::gaugeFromTaggedName(
+                        name, name_tags, tagged_name, import_mode);
                   }));
-          ON_CALL(*scope, counterFromStatNameWithTags(_, _))
-              .WillByDefault(Invoke([this](const Stats::StatName& name,
-                                           Stats::StatNameTagVectorOptConstRef) -> Stats::Counter& {
-                return this->store_.counter(this->context_.store_.symbolTable().toString(name));
-              }));
 
-          ON_CALL(*scope, histogramFromStatNameWithTags(_, _, _))
-              .WillByDefault(Invoke([scope_ptr = scope.get()](
-                                        const Stats::StatName& name,
-                                        Stats::StatNameTagVectorOptConstRef tags,
-                                        Stats::Histogram::Unit unit) -> Stats::Histogram& {
-                return scope_ptr->Stats::MockScope::histogramFromStatNameWithTags(name, tags, unit);
-              }));
+          ON_CALL(*scope, histogramFromTaggedName(_, _, _, _))
+              .WillByDefault(Invoke(
+                  [scope_ptr = scope.get()](Stats::StatName name,
+                                            std::optional<Stats::StatNameTagSpan> name_tags,
+                                            Stats::StatName tagged_name,
+                                            Stats::Histogram::Unit unit) -> Stats::Histogram& {
+                    return scope_ptr->Stats::MockScope::histogramFromTaggedName(name, name_tags,
+                                                                                tagged_name, unit);
+                  }));
 
           scope_ = scope;
           name_storages_.push_back(std::move(scope_name_storage));
@@ -241,11 +242,14 @@ TEST_F(StatsAccessLoggerTest, HistogramUnits) {
 )EOF";
   initialize(yaml);
 
-  EXPECT_CALL(store_, histogram("Unspecified", Stats::Histogram::Unit::Unspecified));
-  EXPECT_CALL(store_, histogram("Bytes", Stats::Histogram::Unit::Bytes));
-  EXPECT_CALL(store_, histogram("Microseconds", Stats::Histogram::Unit::Microseconds));
-  EXPECT_CALL(store_, histogram("Milliseconds", Stats::Histogram::Unit::Milliseconds));
-  EXPECT_CALL(store_, histogram("Percent", Stats::Histogram::Unit::Percent));
+  EXPECT_CALL(store_,
+              histogram("test_stat_prefix.Unspecified", Stats::Histogram::Unit::Unspecified));
+  EXPECT_CALL(store_, histogram("test_stat_prefix.Bytes", Stats::Histogram::Unit::Bytes));
+  EXPECT_CALL(store_,
+              histogram("test_stat_prefix.Microseconds", Stats::Histogram::Unit::Microseconds));
+  EXPECT_CALL(store_,
+              histogram("test_stat_prefix.Milliseconds", Stats::Histogram::Unit::Milliseconds));
+  EXPECT_CALL(store_, histogram("test_stat_prefix.Percent", Stats::Histogram::Unit::Percent));
   logger_->log(formatter_context_, stream_info_);
 }
 
@@ -310,7 +314,7 @@ TEST_F(StatsAccessLoggerTest, NoValueFormatted) {
 
   initialize(yaml);
 
-  absl::optional<std::string> nullopt{absl::nullopt};
+  std::optional<std::string> nullopt{std::nullopt};
   EXPECT_CALL(stream_info_, responseCodeDetails()).WillRepeatedly(testing::ReturnRef(nullopt));
   EXPECT_CALL(store_, counter(_)).Times(0);
   EXPECT_LOG_CONTAINS("error", "Stats access logger computed non-number value: ", {
@@ -331,11 +335,10 @@ TEST_F(StatsAccessLoggerTest, NonNumberValueFormatted) {
 
   initialize(yaml);
 
-  absl::optional<std::string> not_a_number{"hello"};
+  std::optional<std::string> not_a_number{"hello"};
   EXPECT_CALL(stream_info_, responseCodeDetails()).WillRepeatedly(testing::ReturnRef(not_a_number));
   EXPECT_CALL(store_, counter(_)).Times(0);
-  EXPECT_LOG_CONTAINS("error", "Stats access logger formatted a string that isn't a number: hello",
-                      { logger_->log(formatter_context_, stream_info_); });
+  logger_->log(formatter_context_, stream_info_);
 }
 
 // Format string resolved to a number string.
@@ -351,7 +354,7 @@ TEST_F(StatsAccessLoggerTest, NumberStringValueFormatted) {
 
   initialize(yaml);
 
-  absl::optional<std::string> a_number{"42"};
+  std::optional<std::string> a_number{"42"};
   EXPECT_CALL(stream_info_, responseCodeDetails()).WillRepeatedly(testing::ReturnRef(a_number));
   EXPECT_CALL(store_, counter(_));
   EXPECT_CALL(store_.counter_, add(42));
@@ -370,7 +373,7 @@ TEST_F(StatsAccessLoggerTest, CounterValueFixed) {
 
   initialize(yaml);
 
-  absl::optional<std::string> a_number{"42"};
+  std::optional<std::string> a_number{"42"};
   EXPECT_CALL(stream_info_, responseCodeDetails()).WillRepeatedly(testing::ReturnRef(a_number));
   EXPECT_CALL(store_, counter(_));
   EXPECT_CALL(store_.counter_, add(42));
@@ -391,7 +394,7 @@ TEST_F(StatsAccessLoggerTest, HistogramPercent) {
 
   initialize(yaml);
 
-  absl::optional<std::string> a_number{"0.1"};
+  std::optional<std::string> a_number{"0.1"};
   EXPECT_CALL(stream_info_, responseCodeDetails()).WillRepeatedly(testing::ReturnRef(a_number));
   EXPECT_CALL(store_, histogram(_, Stats::Histogram::Unit::Percent))
       .WillOnce(
@@ -425,20 +428,20 @@ TEST_F(StatsAccessLoggerTest, EmptyTagFormatter) {
 
   initialize(yaml);
 
-  absl::optional<std::string> nullopt{absl::nullopt};
+  std::optional<std::string> nullopt{std::nullopt};
   EXPECT_CALL(stream_info_, responseCodeDetails()).WillRepeatedly(testing::ReturnRef(nullopt));
   EXPECT_CALL(stream_info_, responseCode())
-      .WillRepeatedly(testing::Return(absl::optional<uint32_t>{200}));
-  EXPECT_CALL(*scope_, counterFromStatNameWithTags(_, _))
-      .WillOnce(
-          testing::Invoke([this](const Stats::StatName& name,
-                                 Stats::StatNameTagVectorOptConstRef tags) -> Stats::Counter& {
-            EXPECT_EQ("counter", scope_->symbolTable().toString(name));
-            EXPECT_EQ(1, tags->get().size());
-            EXPECT_EQ(":200", scope_->symbolTable().toString(tags->get().front().second));
+      .WillRepeatedly(testing::Return(std::optional<uint32_t>{200}));
+  EXPECT_CALL(*scope_, counterFromTaggedName(_, _, _))
+      .WillOnce(testing::Invoke([this](Stats::StatName name,
+                                       std::optional<Stats::StatNameTagSpan> name_tags,
+                                       Stats::StatName) -> Stats::Counter& {
+        EXPECT_EQ("counter", scope_->symbolTable().toString(name));
+        EXPECT_EQ(1, name_tags->size());
+        EXPECT_EQ(":200", scope_->symbolTable().toString(name_tags->front().second));
 
-            return store_.counter_;
-          }));
+        return store_.counter_;
+      }));
   EXPECT_CALL(store_.counter_, add(1));
   logger_->log(formatter_context_, stream_info_);
 }
@@ -459,7 +462,7 @@ TEST_F(StatsAccessLoggerTest, GaugeNonNumberValueFormatted) {
 
   formatter_context_.setAccessLogType(envoy::data::accesslog::v3::AccessLogType::DownstreamEnd);
 
-  absl::optional<std::string> not_a_number{"hello"};
+  std::optional<std::string> not_a_number{"hello"};
   EXPECT_CALL(stream_info_, responseCodeDetails()).WillRepeatedly(testing::ReturnRef(not_a_number));
   EXPECT_CALL(store_, gauge(_, _)).Times(0);
   // Note: Logging is verified in NonNumberValueFormatted. We skip verification here due to shared
@@ -511,7 +514,7 @@ TEST_F(StatsAccessLoggerTest, GaugeValueFixed) {
 
   formatter_context_.setAccessLogType(envoy::data::accesslog::v3::AccessLogType::DownstreamEnd);
 
-  absl::optional<std::string> a_number{"42"};
+  std::optional<std::string> a_number{"42"};
   EXPECT_CALL(stream_info_, responseCodeDetails()).WillRepeatedly(testing::ReturnRef(a_number));
   EXPECT_CALL(store_, gauge(_, Stats::Gauge::ImportMode::NeverImport));
   EXPECT_CALL(*gauge_, set(42));
@@ -533,7 +536,7 @@ TEST_F(StatsAccessLoggerTest, GaugeOperationTypeSet) {
 
   formatter_context_.setAccessLogType(envoy::data::accesslog::v3::AccessLogType::DownstreamEnd);
 
-  absl::optional<std::string> a_number{"42"};
+  std::optional<std::string> a_number{"42"};
   EXPECT_CALL(stream_info_, responseCodeDetails()).WillRepeatedly(testing::ReturnRef(a_number));
   EXPECT_CALL(store_, gauge(_, Stats::Gauge::ImportMode::NeverImport));
   EXPECT_CALL(*gauge_, set(42));
@@ -846,32 +849,33 @@ TEST_F(StatsAccessLoggerTest, AccessLogStateDestructorSubtractsFromSavedGauge) {
 
   NiceMock<StreamInfo::MockStreamInfo> local_stream_info;
   EXPECT_CALL(local_stream_info, responseCode())
-      .WillRepeatedly(testing::Return(absl::optional<uint32_t>{200}));
+      .WillRepeatedly(testing::Return(std::optional<uint32_t>{200}));
 
   // Initial lookup and add
-  EXPECT_CALL(*mock_scope, gaugeFromStatNameWithTags(_, _, Stats::Gauge::ImportMode::Accumulate))
-      .WillRepeatedly(
-          Invoke([&](const Stats::StatName& name, Stats::StatNameTagVectorOptConstRef tags,
-                     Stats::Gauge::ImportMode) -> Stats::Gauge& {
-            saved_name = name;
-            if (tags) {
-              for (const auto& tag : tags->get()) {
-                saved_tags_strs.emplace_back(store_.symbolTable().toString(tag.first),
-                                             store_.symbolTable().toString(tag.second));
-              }
-              EXPECT_FALSE(saved_tags_strs.empty());
-              auto* gauge_with_tags = dynamic_cast<MockGaugeWithTags*>(gauge_);
-              EXPECT_TRUE(gauge_with_tags != nullptr);
-              gauge_with_tags->setTags(tags->get(), store_.symbolTable());
-            }
-            return *gauge_;
-          }));
+  EXPECT_CALL(*mock_scope, gaugeFromTaggedName(_, _, _, Stats::Gauge::ImportMode::Accumulate))
+      .WillRepeatedly(Invoke([&](Stats::StatName name,
+                                 std::optional<Stats::StatNameTagSpan> name_tags, Stats::StatName,
+                                 Stats::Gauge::ImportMode) -> Stats::Gauge& {
+        saved_name = name;
+        if (name_tags.has_value() && !name_tags->empty()) {
+          for (const auto& tag : *name_tags) {
+            saved_tags_strs.emplace_back(store_.symbolTable().toString(tag.first),
+                                         store_.symbolTable().toString(tag.second));
+          }
+          EXPECT_FALSE(saved_tags_strs.empty());
+          auto* gauge_with_tags = dynamic_cast<MockGaugeWithTags*>(gauge_);
+          EXPECT_TRUE(gauge_with_tags != nullptr);
+          gauge_with_tags->setTags(Stats::StatNameTagVector(name_tags->begin(), name_tags->end()),
+                                   store_.symbolTable());
+        }
+        return *gauge_;
+      }));
 
   EXPECT_CALL(*gauge_, add(10));
   logger_->log(formatter_context_, local_stream_info);
 
   // The destructor of AccessLogState should call sub(10, _) directly on the saved gauge
-  // This will trigger a second lookup using gaugeFromString (tags == absl::nullopt).
+  // This will trigger a second lookup using gaugeFromString (tags == std::nullopt).
   EXPECT_CALL(*gauge_, sub(10));
 
   // local_stream_info goes out of scope here, triggering AccessLogState destructor.
@@ -952,7 +956,7 @@ TEST_F(StatsAccessLoggerTest, StatsScope) {
   // The newly created scope for "test_scope" is stored at the end of `name_storages_` but
   // since `scope_` only stores the last created scope for non-"scope_discovery", it should
   // be exactly `scope_` here.
-  EXPECT_CALL(*scope_, counterFromStatNameWithTags(_, _))
+  EXPECT_CALL(*scope_, counterFromTaggedName(_, _, _))
       .WillOnce(testing::ReturnRef(store_.counter_));
   EXPECT_CALL(store_.counter_, add(1));
   logger_->log(formatter_context, stream_info);
@@ -1125,16 +1129,16 @@ TEST_F(StatsAccessLoggerTest, StatTagFilterUpdateTag) {
   initialize(yaml);
 
   // Case 1: Filter matches (tag foo=bar), so update tag action is executed.
-  EXPECT_CALL(*scope_, counterFromStatNameWithTags(_, _))
-      .WillOnce(
-          testing::Invoke([this](const Stats::StatName& name,
-                                 Stats::StatNameTagVectorOptConstRef tags) -> Stats::Counter& {
-            EXPECT_EQ("counter", scope_->symbolTable().toString(name));
-            EXPECT_EQ(1, tags->get().size());
-            EXPECT_EQ("foo", scope_->symbolTable().toString(tags->get()[0].first));
-            EXPECT_EQ("baz", scope_->symbolTable().toString(tags->get()[0].second));
-            return scope_->counterFromStatNameWithTags_(name, tags);
-          }));
+  EXPECT_CALL(*scope_, counterFromTaggedName(_, _, _))
+      .WillOnce(testing::Invoke([this](Stats::StatName name,
+                                       std::optional<Stats::StatNameTagSpan> name_tags,
+                                       Stats::StatName tagged_name) -> Stats::Counter& {
+        EXPECT_EQ("counter", scope_->symbolTable().toString(name));
+        EXPECT_EQ(1, name_tags->size());
+        EXPECT_EQ("foo", scope_->symbolTable().toString((*name_tags)[0].first));
+        EXPECT_EQ("baz", scope_->symbolTable().toString((*name_tags)[0].second));
+        return scope_->counterFromTaggedName_(name, name_tags, tagged_name);
+      }));
   logger_->log(formatter_context_, stream_info_);
 }
 
@@ -1168,14 +1172,14 @@ TEST_F(StatsAccessLoggerTest, StatTagFilterDropTag) {
   initialize(yaml);
 
   // Case 1: Filter matches (tag foo=bar), so drop tag action is executed.
-  EXPECT_CALL(*scope_, counterFromStatNameWithTags(_, _))
-      .WillOnce(
-          testing::Invoke([this](const Stats::StatName& name,
-                                 Stats::StatNameTagVectorOptConstRef tags) -> Stats::Counter& {
-            EXPECT_EQ("counter", scope_->symbolTable().toString(name));
-            EXPECT_EQ(0, tags->get().size());
-            return scope_->counterFromStatNameWithTags_(name, tags);
-          }));
+  EXPECT_CALL(*scope_, counterFromTaggedName(_, _, _))
+      .WillOnce(testing::Invoke([this](Stats::StatName name,
+                                       std::optional<Stats::StatNameTagSpan> name_tags,
+                                       Stats::StatName tagged_name) -> Stats::Counter& {
+        EXPECT_EQ("counter", scope_->symbolTable().toString(name));
+        EXPECT_EQ(0, name_tags->size());
+        return scope_->counterFromTaggedName_(name, name_tags, tagged_name);
+      }));
   logger_->log(formatter_context_, stream_info_);
 }
 
@@ -1288,13 +1292,13 @@ TEST_F(StatsAccessLoggerTest, StatTagFilterUpdateTagOnGauge) {
   ASSERT_TRUE(mock_scope != nullptr);
 
   // Case 1: Filter matches (tag foo=bar), so update tag action is executed.
-  EXPECT_CALL(*mock_scope, gaugeFromStatNameWithTags(_, _, _))
-      .WillOnce(Invoke([&](const Stats::StatName& name, Stats::StatNameTagVectorOptConstRef tags,
-                           Stats::Gauge::ImportMode) -> Stats::Gauge& {
+  EXPECT_CALL(*mock_scope, gaugeFromTaggedName(_, _, _, _))
+      .WillOnce(Invoke([&](Stats::StatName name, std::optional<Stats::StatNameTagSpan> name_tags,
+                           Stats::StatName, Stats::Gauge::ImportMode) -> Stats::Gauge& {
         EXPECT_EQ("gauge", scope_->symbolTable().toString(name));
-        EXPECT_EQ(1, tags->get().size());
-        EXPECT_EQ("foo", scope_->symbolTable().toString(tags->get()[0].first));
-        EXPECT_EQ("baz", scope_->symbolTable().toString(tags->get()[0].second));
+        EXPECT_EQ(1, name_tags->size());
+        EXPECT_EQ("foo", scope_->symbolTable().toString((*name_tags)[0].first));
+        EXPECT_EQ("baz", scope_->symbolTable().toString((*name_tags)[0].second));
         return *gauge_;
       }));
   logger_->log(formatter_context_, stream_info_);
@@ -1335,16 +1339,17 @@ TEST_F(StatsAccessLoggerTest, StatTagFilterUpdateTagOnHistogram) {
   ASSERT_TRUE(mock_scope != nullptr);
 
   // Case 1: Filter matches (tag foo=bar), so update tag action is executed.
-  EXPECT_CALL(*mock_scope, histogramFromStatNameWithTags(_, _, _))
-      .WillOnce(Invoke([&](const Stats::StatName& name, Stats::StatNameTagVectorOptConstRef tags,
-                           Stats::Histogram::Unit) -> Stats::Histogram& {
-        EXPECT_EQ("histogram", scope_->symbolTable().toString(name));
-        EXPECT_EQ(1, tags->get().size());
-        EXPECT_EQ("foo", scope_->symbolTable().toString(tags->get()[0].first));
-        EXPECT_EQ("baz", scope_->symbolTable().toString(tags->get()[0].second));
-        return store_.mockScope().histogramFromStatNameWithTags(name, tags,
-                                                                Stats::Histogram::Unit::Bytes);
-      }));
+  EXPECT_CALL(*mock_scope, histogramFromTaggedName(_, _, _, _))
+      .WillOnce(
+          Invoke([&](Stats::StatName name, std::optional<Stats::StatNameTagSpan> name_tags,
+                     Stats::StatName tagged_name, Stats::Histogram::Unit) -> Stats::Histogram& {
+            EXPECT_EQ("histogram", scope_->symbolTable().toString(name));
+            EXPECT_EQ(1, name_tags->size());
+            EXPECT_EQ("foo", scope_->symbolTable().toString((*name_tags)[0].first));
+            EXPECT_EQ("baz", scope_->symbolTable().toString((*name_tags)[0].second));
+            return store_.mockScope().histogramFromTaggedName(name, name_tags, tagged_name,
+                                                              Stats::Histogram::Unit::Bytes);
+          }));
   logger_->log(formatter_context_, stream_info_);
 }
 
@@ -1357,9 +1362,9 @@ TEST(GaugeKeyTest, EqualityAndHashing) {
   Stats::StatName name1 = pool.add("name1");
   Stats::StatName name2 = pool.add("name2");
 
-  GaugeKey key1(name1, absl::nullopt);
-  GaugeKey key2(name1, absl::nullopt);
-  GaugeKey key3(name2, absl::nullopt);
+  GaugeKey key1(name1, std::nullopt);
+  GaugeKey key2(name1, std::nullopt);
+  GaugeKey key3(name2, std::nullopt);
 
   // Basic equality
   EXPECT_EQ(key1, key2);
@@ -1377,9 +1382,9 @@ TEST(GaugeKeyTest, EqualityAndHashing) {
   Stats::StatNameTagVector tags1 = {{tag_n1, tag_v1}};
   Stats::StatNameTagVector tags2 = {{tag_n1, tag_v2}};
 
-  GaugeKey key_tags1(name1, std::cref(tags1));
-  GaugeKey key_tags2(name1, std::cref(tags1));
-  GaugeKey key_tags3(name1, std::cref(tags2));
+  GaugeKey key_tags1(name1, tags1);
+  GaugeKey key_tags2(name1, tags1);
+  GaugeKey key_tags3(name1, tags2);
 
   EXPECT_EQ(key_tags1, key_tags2);
   EXPECT_NE(key_tags1, key_tags3);
@@ -1389,7 +1394,7 @@ TEST(GaugeKeyTest, EqualityAndHashing) {
   EXPECT_NE(absl::Hash<GaugeKey>{}(key_tags1), absl::Hash<GaugeKey>{}(key_tags3));
 
   // Borrowed vs Owned
-  GaugeKey key_owned(name1, std::cref(tags1));
+  GaugeKey key_owned(name1, tags1);
   key_owned.makeOwned();
 
   EXPECT_EQ(key_tags1, key_owned); // Borrowed vs Owned should be equal if content is same //
@@ -1411,14 +1416,14 @@ TEST(GaugeKeyTest, VerifyAbslHashCorrectness) {
   Stats::StatNameTagVector tags1 = {{tag_n1, tag_v1}};
   Stats::StatNameTagVector tags2 = {{tag_n1, tag_v2}};
 
-  GaugeKey key_empty1(name1, absl::nullopt);
-  GaugeKey key_empty2(name2, absl::nullopt);
+  GaugeKey key_empty1(name1, std::nullopt);
+  GaugeKey key_empty2(name2, std::nullopt);
 
-  GaugeKey key_borrowed(name1, std::cref(tags1));
-  GaugeKey key_owned(name1, std::cref(tags1));
+  GaugeKey key_borrowed(name1, tags1);
+  GaugeKey key_owned(name1, tags1);
   key_owned.makeOwned();
 
-  GaugeKey key_tags2(name1, std::cref(tags2));
+  GaugeKey key_tags2(name1, tags2);
 
   EXPECT_TRUE(absl::VerifyTypeImplementsAbslHashCorrectly(
       std::make_tuple(std::move(key_empty1), std::move(key_empty2), std::move(key_borrowed),
@@ -1443,7 +1448,7 @@ TEST(GaugeKeyTest, ExactMemoryFootprint) {
   // 1. Check memory usage of empty GaugeKey (no heap should be used by GaugeKey itself).
   {
     Memory::TestUtil::MemoryTest memory_test;
-    GaugeKey key(name, absl::nullopt);
+    GaugeKey key(name, std::nullopt);
     // GaugeKey on stack, no heap should be allocated.
     EXPECT_MEMORY_EQ(memory_test.consumedBytes(), 0);
   }
@@ -1451,14 +1456,14 @@ TEST(GaugeKeyTest, ExactMemoryFootprint) {
   // 2. Check memory usage of Borrowed tags GaugeKey.
   {
     Memory::TestUtil::MemoryTest memory_test;
-    GaugeKey key(name, std::cref(tags));
+    GaugeKey key(name, tags);
     // Borrowed tags should NOT cause heap allocation by GaugeKey itself.
     EXPECT_MEMORY_EQ(memory_test.consumedBytes(), 0);
   }
 
   // 3. Check memory usage after making it owned.
   {
-    GaugeKey key(name, std::cref(tags));
+    GaugeKey key(name, tags);
 
     Memory::TestUtil::MemoryTest memory_test;
     key.makeOwned();
@@ -1502,8 +1507,8 @@ TEST_F(StatsAccessLoggerTest, AccessLogStateMemoryFootprint) {
 
     // 1. Add multiple items
     for (int i = 0; i < NUM_ITEMS; ++i) {
-      access_log_state->addInflightGauge(names[i], std::cref(tags),
-                                         Stats::Gauge::ImportMode::Accumulate, 1, {});
+      access_log_state->addInflightGauge(names[i], tags, Stats::Gauge::ImportMode::Accumulate, 1,
+                                         {});
     }
 
     // Verify it is within bounds (e.g., less than 384 bytes per entry including map overhead).
@@ -1518,8 +1523,8 @@ TEST_F(StatsAccessLoggerTest, AccessLogStateMemoryFootprint) {
 
     // 2. Remove all items
     for (int i = 0; i < NUM_ITEMS; ++i) {
-      access_log_state->removeInflightGauge(names[i], std::cref(tags),
-                                            Stats::Gauge::ImportMode::Accumulate, 1);
+      access_log_state->removeInflightGauge(names[i], tags, Stats::Gauge::ImportMode::Accumulate,
+                                            1);
     }
 
     // absl::flat_hash_map is designed to not release its slots after removing entries,

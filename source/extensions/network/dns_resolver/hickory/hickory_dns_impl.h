@@ -1,6 +1,5 @@
 #pragma once
 
-#include <atomic>
 #include <cstdint>
 #include <string>
 
@@ -57,7 +56,7 @@ using OnDnsResolverResetNetworkingType =
  */
 class HickoryDnsResolverConfig {
 public:
-  static std::shared_ptr<HickoryDnsResolverConfig>
+  static absl::StatusOr<std::shared_ptr<HickoryDnsResolverConfig>>
   create(const envoy::extensions::network::dns_resolver::hickory::v3::HickoryDnsResolverConfig&
              proto_config);
 
@@ -77,6 +76,16 @@ public:
 
 private:
   HickoryDnsResolverConfig() = default;
+
+  // Test-only entry point that allows the module name to be overridden so tests can exercise
+  // dynamic-module load, ABI symbol resolution, and Rust-side rejection failure paths that are
+  // unreachable through the public ``create()`` against the statically linked production module.
+  // Accessed via ``HickoryDnsResolverConfigTestPeer``.
+  friend class HickoryDnsResolverConfigTestPeer;
+  static absl::StatusOr<std::shared_ptr<HickoryDnsResolverConfig>> createForModule(
+      const envoy::extensions::network::dns_resolver::hickory::v3::HickoryDnsResolverConfig&
+          proto_config,
+      absl::string_view module_name);
 
   Extensions::DynamicModules::DynamicModulePtr dynamic_module_;
 };
@@ -102,7 +111,6 @@ public:
   DnsResolver::ResolveCb callback_;
   const uint64_t query_id_;
   const std::string dns_name_;
-  bool cancelled_ = false;
   HickoryDnsResolver& parent_;
 };
 
@@ -111,11 +119,18 @@ public:
  * This is a thread-safe resolver: resolve() is called on the dispatcher thread, and the
  * module may deliver results from any thread. The shell posts results back to the correct
  * dispatcher thread.
+ *
+ * Inherits from `std::enable_shared_from_this` so the ABI completion callback can capture
+ * a `std::weak_ptr` into the lambda it posts to the dispatcher. Locking the weak pointer
+ * inside the lambda detects whether the resolver has been destroyed in the window between
+ * posting and execution, avoiding a use-after-free on the dispatcher drain path.
  */
-class HickoryDnsResolver : public DnsResolver, protected Logger::Loggable<Logger::Id::dns> {
+class HickoryDnsResolver : public DnsResolver,
+                           public std::enable_shared_from_this<HickoryDnsResolver>,
+                           protected Logger::Loggable<Logger::Id::dns> {
 public:
   HickoryDnsResolver(HickoryDnsResolverConfigSharedPtr config, Event::Dispatcher& dispatcher,
-                     Stats::Scope& root_scope);
+                     Stats::Scope& root_scope, absl::Status& creation_status);
   ~HickoryDnsResolver() override;
 
   static HickoryDnsResolverStats generateHickoryDnsResolverStats(Stats::Scope& scope);
@@ -132,12 +147,16 @@ public:
   void onResolveComplete(uint64_t query_id, envoy_dynamic_module_type_dns_resolution_status status,
                          absl::string_view details, std::list<DnsResponse>&& response);
 
+  /**
+   * Registers the resolver for completion callbacks. Must be called after construction so
+   * weak_from_this is valid.
+   */
+  void registerForCompletions();
+
 private:
   friend class HickoryPendingResolution;
-  friend void ::envoy_dynamic_module_callback_dns_resolve_complete(
-      envoy_dynamic_module_type_dns_resolver_envoy_ptr, uint64_t,
-      envoy_dynamic_module_type_dns_resolution_status, envoy_dynamic_module_type_module_buffer,
-      const envoy_dynamic_module_type_dns_address*, size_t);
+  // Test-only access to the private token used to drive the completion callback.
+  friend class HickoryDnsResolverTestPeer;
 
   static envoy_dynamic_module_type_dns_lookup_family
   toLookupFamily(DnsLookupFamily dns_lookup_family);
@@ -147,11 +166,11 @@ private:
   HickoryDnsResolverConfigSharedPtr config_;
   Event::Dispatcher& dispatcher_;
   envoy_dynamic_module_type_dns_resolver_module_ptr resolver_module_ptr_;
+  // Never-reused token handed to the module as the resolver pointer. The completion callback
+  // resolves it to this resolver so a completion after destruction is dropped safely.
+  uint64_t token_{0};
   uint64_t next_query_id_ = 1;
   absl::flat_hash_map<uint64_t, HickoryPendingResolution*> pending_queries_;
-  // Checked by the ABI callback from `Tokio` threads to avoid posting to the dispatcher
-  // after the resolver begins destruction.
-  std::atomic<bool> shutting_down_{false};
   Stats::ScopeSharedPtr scope_;
   HickoryDnsResolverStats stats_;
 };

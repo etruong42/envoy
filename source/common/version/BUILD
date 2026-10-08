@@ -22,11 +22,8 @@ genrule(
     srcs = ["//:API_VERSION.txt"],
     outs = ["api_version_number.h"],
     cmd = """
-    PYPATH=$$(realpath $$(dirname $(PYTHON3)))
-    export PATH=$$PYPATH:$$PATH
     ./$(location //tools/api_versioning:generate_api_version_header_bin) $< >$@
     """,
-    toolchains = ["@rules_python//python:current_py_toolchain"],
     tools = ["//tools/api_versioning:generate_api_version_header_bin"],
     visibility = ["//visibility:private"],
 )
@@ -63,10 +60,10 @@ envoy_cc_library(
     hdrs = [":generate_version_number"],
     copts = select({
         "//bazel:using_boringssl_fips": ["-DENVOY_SSL_VERSION=\\\"BoringSSL-FIPS\\\""],
-        "//bazel:using_aws_lc": ["-DENVOY_SSL_VERSION=\\\"AWS-LC-FIPS\\\""],
         "//bazel:using_openssl": ["-DENVOY_SSL_VERSION=\\\"OpenSSL\\\""],
         "//conditions:default": ["-DENVOY_SSL_VERSION=\\\"BoringSSL\\\""],
     }),
+    tags = ["notidy"],
     deps = [
         ":version_string_interface_lib",
         ":version_suffix_default",

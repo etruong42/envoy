@@ -97,7 +97,8 @@ public:
     // We can continue the test once we're sure that Envoy's ClusterManager has made use of
     // the DiscoveryResponse describing cluster_1 that we sent.
     // 2 because the statically specified CDS server itself counts as a cluster.
-    test_server_->waitForGaugeGe("cluster_manager.active_clusters", initial_clusters_num + 1);
+    test_server_->waitForGauge("cluster_manager.active_clusters",
+                               testing::Ge(initial_clusters_num + 1));
 
     // Wait for our statically specified listener to become ready, and register its port in the
     // test framework's downstream listener port map.
@@ -136,7 +137,7 @@ public:
                                           ->add_config_validators();
       envoy::extensions::config::validators::minimum_clusters::v3::MinimumClustersValidator config;
       config.set_min_clusters_num(threshold);
-      config_validator_config->mutable_typed_config()->PackFrom(config);
+      std::ignore = config_validator_config->mutable_typed_config()->PackFrom(config);
       config_validator_config->set_name("minimum_cluster_validator");
     });
   }

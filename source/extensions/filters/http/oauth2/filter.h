@@ -26,6 +26,7 @@
 #include "source/extensions/filters/http/oauth2/oauth.h"
 #include "source/extensions/filters/http/oauth2/oauth_client.h"
 
+#include "absl/status/statusor.h"
 #include "absl/strings/str_split.h"
 #include "absl/strings/string_view.h"
 
@@ -49,38 +50,65 @@ using OAuth2Headers = ConstSingleton<OAuth2HeaderValues>;
 
 class OAuth2Client;
 
+// Entry names used when ``token_secret`` is supplied as a multi-entry generic secret. This form is
+// only used with the ``PRIVATE_KEY_JWT`` auth type, where it allows the key ID to be distributed
+// together with the signing key so the two do not drift apart.
+constexpr absl::string_view PrivateKeySecretEntry = "private_key";
+constexpr absl::string_view KeyIdSecretEntry = "key_id";
+
 // Helper class used to fetch secrets (usually from SDS).
 class SecretReader {
 public:
   virtual ~SecretReader() = default;
+  // The OAuth client secret sent to the token endpoint by the auth types that use a shared
+  // secret. Only ever the single-value form of ``token_secret``.
   virtual const std::string& clientSecret() const PURE;
   virtual const std::string& hmacSecret() const PURE;
+  // The PEM-encoded key used to sign the JWT client assertion, taken from the ``private_key``
+  // entry of a multi-entry ``token_secret``, or from a single-value secret.
+  virtual const std::string& privateKey() const PURE;
+  // The key ID distributed alongside the signing key in a multi-entry ``token_secret``, or an
+  // empty string when the secret does not carry one.
+  virtual const std::string& keyId() const PURE;
 };
 
 class SDSSecretReader : public SecretReader {
 public:
   SDSSecretReader(Secret::GenericSecretConfigProviderSharedPtr&& client_secret_provider,
                   Secret::GenericSecretConfigProviderSharedPtr&& hmac_secret_provider,
-                  ThreadLocal::SlotAllocator& tls, Api::Api& api)
-      : client_secret_(
-            client_secret_provider
-                ? THROW_OR_RETURN_VALUE(Secret::ThreadLocalGenericSecretProvider::create(
-                                            std::move(client_secret_provider), tls, api),
-                                        std::unique_ptr<Secret::ThreadLocalGenericSecretProvider>)
-                : nullptr),
+                  ThreadLocal::SlotAllocator& tls, Api::Api& api,
+                  Event::Dispatcher& main_dispatcher)
+      : client_secret_(client_secret_provider
+                           ? THROW_OR_RETURN_VALUE(
+                                 Secret::ThreadLocalGenericSecretProvider::create(
+                                     std::move(client_secret_provider), tls, api, main_dispatcher),
+                                 Secret::ThreadLocalGenericSecretProviderPtr)
+                           : nullptr),
         hmac_secret_(
             THROW_OR_RETURN_VALUE(Secret::ThreadLocalGenericSecretProvider::create(
-                                      std::move(hmac_secret_provider), tls, api),
-                                  std::unique_ptr<Secret::ThreadLocalGenericSecretProvider>)),
+                                      std::move(hmac_secret_provider), tls, api, main_dispatcher),
+                                  Secret::ThreadLocalGenericSecretProviderPtr)),
         empty_client_secret_("") {}
   const std::string& clientSecret() const override {
     return client_secret_ ? client_secret_->secret() : empty_client_secret_;
   }
   const std::string& hmacSecret() const override { return hmac_secret_->secret(); }
+  const std::string& privateKey() const override {
+    if (client_secret_ == nullptr) {
+      return empty_client_secret_;
+    }
+    // A single-value secret holds the key directly; a multi-entry secret holds it in a named
+    // entry alongside the key ID.
+    const std::string& value = client_secret_->secret();
+    return value.empty() ? client_secret_->secret(PrivateKeySecretEntry) : value;
+  }
+  const std::string& keyId() const override {
+    return client_secret_ ? client_secret_->secret(KeyIdSecretEntry) : empty_client_secret_;
+  }
 
 private:
-  std::unique_ptr<Secret::ThreadLocalGenericSecretProvider> client_secret_;
-  std::unique_ptr<Secret::ThreadLocalGenericSecretProvider> hmac_secret_;
+  Secret::ThreadLocalGenericSecretProviderPtr client_secret_;
+  Secret::ThreadLocalGenericSecretProviderPtr hmac_secret_;
   const std::string empty_client_secret_;
 };
 
@@ -94,7 +122,8 @@ private:
   COUNTER(oauth_success)                                                                           \
   COUNTER(oauth_refreshtoken_success)                                                              \
   COUNTER(oauth_refreshtoken_failure)                                                              \
-  COUNTER(oauth_allow_failed_passthrough)
+  COUNTER(oauth_allow_failed_passthrough)                                                          \
+  COUNTER(oauth_legacy_cbc_decrypt)
 
 /**
  * Wrapper struct filter stats. @see stats_macros.h
@@ -153,11 +182,20 @@ public:
   FilterConfig(const envoy::extensions::filters::http::oauth2::v3::OAuth2Config& proto_config,
                Server::Configuration::CommonFactoryContext& context,
                std::shared_ptr<SecretReader> secret_reader, Stats::Scope& scope,
-               const std::string& stats_prefix);
+               const std::string& stats_prefix, absl::Status& creation_status);
   const std::string& clusterName() const { return oauth_token_endpoint_.cluster(); }
   const std::string& clientId() const { return client_id_; }
   bool forwardBearerToken() const { return forward_bearer_token_; }
   bool preserveAuthorizationHeader() const { return preserve_authorization_header_; }
+  // Whether the OIDC ID token should be forwarded upstream.
+  bool forwardIdToken() const { return !forward_id_token_header_.get().empty(); }
+  // The upstream header that carries the forwarded ID token (empty when forwarding is disabled).
+  const Http::LowerCaseString& forwardIdTokenHeader() const { return forward_id_token_header_; }
+  // Whether the ID token is forwarded on the ``Authorization`` header (using the ``Bearer ``
+  // prefix) rather than a custom header carrying the raw token value.
+  bool forwardIdTokenOnAuthorizationHeader() const {
+    return forward_id_token_header_ == Http::CustomHeaders::get().Authorization;
+  }
   const std::vector<Http::HeaderUtility::HeaderDataPtr>& passThroughMatchers() const {
     return pass_through_header_matchers_;
   }
@@ -170,19 +208,39 @@ public:
   const HttpUri& oauthTokenEndpoint() const { return oauth_token_endpoint_; }
   const Http::Utility::Url& authorizationEndpointUrl() const { return authorization_endpoint_url_; }
   const std::string& endSessionEndpoint() const { return end_session_endpoint_; }
+  const Formatter::Formatter* postLogoutRedirectUri() const {
+    return post_logout_redirect_uri_formatter_.get();
+  }
+  bool disablePostLogoutRedirectUri() const { return disable_post_logout_redirect_uri_; }
   const Http::Utility::QueryParamsMulti& authorizationQueryParams() const {
     return authorization_query_params_;
   }
-  const std::string& redirectUri() const { return redirect_uri_; }
+  const Formatter::Formatter& redirectUri() const { return *redirect_uri_formatter_; }
+  const std::vector<std::string>& allowedRedirectDomains() const {
+    return allowed_redirect_domains_;
+  }
+  const Formatter::Formatter* originalRequestUri() const {
+    return original_request_uri_formatter_.get();
+  }
   const Matchers::PathMatcher& redirectPathMatcher() const { return redirect_matcher_; }
   const Matchers::PathMatcher& signoutPath() const { return signout_path_; }
-  std::string clientSecret() const { return secret_reader_->clientSecret(); }
-  std::string hmacSecret() const { return secret_reader_->hmacSecret(); }
+  // Return string view is safe because the filter will consume the value immediately and not store
+  // it.
+  absl::string_view clientSecret() const { return secret_reader_->clientSecret(); }
+  absl::string_view hmacSecret() const { return secret_reader_->hmacSecret(); }
+  absl::string_view privateKey() const { return secret_reader_->privateKey(); }
+  absl::string_view keyId() const { return secret_reader_->keyId(); }
   // The secrets are loaded asynchronously if per-route configurations are used, so the filter needs
   // to check if the secrets are available before processing the request.
   bool requiredSecretsAvailable() const {
-    return !secret_reader_->hmacSecret().empty() &&
-           (auth_type_ == AuthType::TlsClientAuth || !secret_reader_->clientSecret().empty());
+    if (secret_reader_->hmacSecret().empty()) {
+      return false;
+    }
+    if (auth_type_ == AuthType::TlsClientAuth) {
+      return true;
+    }
+    return auth_type_ == AuthType::PrivateKeyJwt ? !secret_reader_->privateKey().empty()
+                                                 : !secret_reader_->clientSecret().empty();
   }
   FilterStats& stats() const { return stats_; }
   const std::string& encodedResourceQueryParams() const { return encoded_resource_query_params_; }
@@ -201,6 +259,9 @@ public:
   bool disableIdTokenSetCookie() const { return disable_id_token_set_cookie_; }
   bool disableAccessTokenSetCookie() const { return disable_access_token_set_cookie_; }
   bool disableRefreshTokenSetCookie() const { return disable_refresh_token_set_cookie_; }
+  bool useAccessTokenExpiryForIdTokenCookie() const {
+    return use_access_token_expiry_for_id_token_cookie_;
+  }
   const Router::RetryPolicyConstSharedPtr& retryPolicy() const { return retry_policy_; }
   bool shouldUseRefreshToken(
       const envoy::extensions::filters::http::oauth2::v3::OAuth2Config& proto_config) const;
@@ -232,6 +293,9 @@ public:
     return code_verifier_cookie_settings_;
   }
   bool disableTokenEncryption() const { return disable_token_encryption_; }
+  const std::string& jwtSigningAlgorithm() const { return jwt_signing_algorithm_; }
+  std::chrono::seconds jwtAssertionLifetime() const { return jwt_assertion_lifetime_; }
+  const std::string& jwtAssertionAudience() const { return jwt_assertion_audience_; }
 
 private:
   static FilterStats generateStats(const std::string& prefix,
@@ -242,9 +306,13 @@ private:
   const std::string authorization_endpoint_;
   Http::Utility::Url authorization_endpoint_url_;
   const std::string end_session_endpoint_;
+  Formatter::FormatterPtr post_logout_redirect_uri_formatter_;
+  const bool disable_post_logout_redirect_uri_ : 1;
   const Http::Utility::QueryParamsMulti authorization_query_params_;
   const std::string client_id_;
-  const std::string redirect_uri_;
+  Formatter::FormatterPtr redirect_uri_formatter_;
+  Formatter::FormatterPtr original_request_uri_formatter_;
+  const std::vector<std::string> allowed_redirect_domains_;
   const Matchers::PathMatcher redirect_matcher_;
   const Matchers::PathMatcher signout_path_;
   std::shared_ptr<SecretReader> secret_reader_;
@@ -261,6 +329,10 @@ private:
   const std::chrono::seconds default_refresh_token_expires_in_;
   const std::chrono::seconds csrf_token_expires_in_;
   const std::chrono::seconds code_verifier_token_expires_in_;
+  // Always initialized even for non-JWT auth types; minimal overhead (two strings + 8 bytes).
+  const std::string jwt_signing_algorithm_;
+  const std::chrono::seconds jwt_assertion_lifetime_;
+  const std::string jwt_assertion_audience_;
   const bool forward_bearer_token_ : 1;
   const bool preserve_authorization_header_ : 1;
   const bool use_refresh_token_ : 1;
@@ -268,6 +340,10 @@ private:
   const bool disable_access_token_set_cookie_ : 1;
   const bool disable_refresh_token_set_cookie_ : 1;
   const bool disable_token_encryption_ : 1;
+  const bool use_access_token_expiry_for_id_token_cookie_ : 1;
+  // The upstream header used to forward the OIDC ID token. Empty when ID token forwarding is
+  // disabled.
+  const Http::LowerCaseString forward_id_token_header_;
   Router::RetryPolicyConstSharedPtr retry_policy_;
   const CookieSettings bearer_token_cookie_settings_;
   const CookieSettings hmac_cookie_settings_;
@@ -295,8 +371,9 @@ class CookieValidator {
 public:
   virtual ~CookieValidator() = default;
   virtual const std::string& token() const PURE;
+  virtual const std::string& idToken() const PURE;
   virtual const std::string& refreshToken() const PURE;
-  virtual void setParams(const Http::RequestHeaderMap& headers, const std::string& secret) PURE;
+  virtual void setParams(const Http::RequestHeaderMap& headers, absl::string_view secret) PURE;
   virtual bool isValid() const PURE;
   virtual bool canUpdateTokenByRefreshToken() const PURE;
 };
@@ -308,9 +385,10 @@ public:
       : time_source_(time_source), cookie_names_(cookie_names), cookie_domain_(cookie_domain) {}
 
   const std::string& token() const override { return access_token_; }
+  const std::string& idToken() const override { return id_token_; }
   const std::string& refreshToken() const override { return refresh_token_; }
 
-  void setParams(const Http::RequestHeaderMap& headers, const std::string& secret) override;
+  void setParams(const Http::RequestHeaderMap& headers, absl::string_view secret) override;
   bool isValid() const override;
   bool hmacIsValid() const;
   bool timestampIsValid() const;
@@ -322,7 +400,7 @@ private:
   std::string refresh_token_;
   std::string expires_;
   std::string hmac_;
-  std::vector<uint8_t> secret_;
+  std::string secret_;
   std::string host_;
   TimeSource& time_source_;
   const CookieNames cookie_names_;
@@ -357,6 +435,7 @@ public:
   // Http::PassThroughFilter
   Http::FilterHeadersStatus decodeHeaders(Http::RequestHeaderMap& headers, bool) override;
   Http::FilterHeadersStatus encodeHeaders(Http::ResponseHeaderMap& headers, bool) override;
+  void onDestroy() override;
 
   // FilterCallbacks
   void onGetAccessTokenSuccess(const std::string& access_code, const std::string& id_token,
@@ -378,6 +457,11 @@ public:
 
   void finishGetAccessTokenFlow();
   void finishRefreshAccessTokenFlow();
+
+  // Forwards the OIDC ID token upstream on the configured header, if ID token forwarding is
+  // enabled and the token is non-empty. When the configured header is ``Authorization`` the token
+  // is forwarded with the ``Bearer `` prefix; otherwise the raw token value is set on the header.
+  void forwardIdToken(Http::RequestHeaderMap& headers, const std::string& id_token) const;
   void updateTokens(const std::string& access_token, const std::string& id_token,
                     const std::string& refresh_token, std::chrono::seconds expires_in);
 
@@ -399,11 +483,16 @@ private:
   std::string original_request_url_;
   std::string flow_id_;
   Http::RequestHeaderMap* request_headers_{nullptr};
+  // Whether the request path is the OAuth callback path. Computed once in decodeHeaders() so the
+  // path matcher does not have to run again on the failure paths.
+  bool is_redirect_path_{false};
   bool was_refresh_token_flow_{false};
 
-  std::shared_ptr<OAuth2Client> oauth_client_;
   FilterConfigSharedPtr default_config_;
   const FilterConfig* config_{nullptr};
+  // Declared after the configs on purpose: the client holds a reference to the token endpoint URI
+  // owned by the FilterConfig, so it must be destroyed before default_config_ is released.
+  std::shared_ptr<OAuth2Client> oauth_client_;
   OAuth2ClientFactory oauth_client_factory_;
   ValidatorFactory validator_factory_;
   TimeSource& time_source_;
@@ -440,13 +529,51 @@ private:
   std::string encryptToken(const std::string& token) const;
   std::string decryptToken(const std::string& encrypted_token) const;
   void removeOAuthFlowCookies(Http::RequestHeaderMap& headers) const;
+  absl::StatusOr<std::string> getClientCredential();
   void removeOAuthTokenCookies(Http::RequestHeaderMap& headers) const;
   bool shouldAllowFailed(const Http::RequestHeaderMap& headers) const;
   bool shouldDenyRedirect(const Http::RequestHeaderMap& headers) const;
   void continueWithFailedOAuth(const std::string& reason, const std::string& extra_details = "");
+  // Creates the OAuth client on first use. Requests that are served from a valid cookie never
+  // talk to the token endpoint, so the client is not created for them.
+  OAuth2Client& oauthClient();
   void sendUnauthorizedResponse(const std::string& details);
   void sendSecretsNotReadyResponse(const std::string& details);
 };
+
+struct DecryptResult {
+  std::string plaintext;
+  std::optional<std::string> error;
+  // Whether the decrypted token was encrypted with GCM (true) or CBC (false).
+  bool is_gcm = false;
+};
+
+/**
+ * Decrypt an OAuth2 cookie ciphertext.
+ *
+ * Cookies carrying the ``gcm.`` algorithm marker are decrypted with AES-256-GCM. Cookies
+ * without the marker are treated as legacy AES-256-CBC ciphertexts. The CBC fallback is only
+ * attempted when the runtime flag ``envoy.reloadable_features.oauth2_legacy_cbc_decrypt_compat``
+ * is true (the default during the migration window), and emits an info-level log on success so
+ * operators can observe legacy usage. Once the flag is set to false the CBC fallback is bypassed
+ * and legacy cookies are rejected; this is the post-migration state that fully closes
+ * CVE-2026-47775. Both the flag and the CBC fallback are scheduled for removal.
+ */
+DecryptResult decrypt(absl::string_view encrypted, absl::string_view secret);
+
+/**
+ * Encrypt an OAuth2 cookie plaintext.
+ *
+ * Dispatches on the runtime flag ``envoy.reloadable_features.oauth2_use_gcm_encryption``:
+ * when true the ciphertext is produced with AES-256-GCM and carries a ``gcm.`` marker, and
+ * when false (the default during the migration window) the ciphertext is produced with the
+ * legacy AES-256-CBC format with no marker. The default exists so that newly upgraded
+ * instances stay wire-compatible with older instances during a rolling upgrade; operators
+ * must flip this flag to true cluster-wide to be protected against CVE-2026-47775. The flag
+ * and the CBC encrypt path are scheduled for removal.
+ */
+std::string encrypt(absl::string_view plaintext, absl::string_view secret,
+                    Random::RandomGenerator& random);
 
 } // namespace Oauth2
 } // namespace HttpFilters

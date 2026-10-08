@@ -15,7 +15,7 @@ envoy_extension_cc_test(
     name = "fluentd_access_log_impl_test",
     srcs = ["fluentd_access_log_impl_test.cc"],
     extension_names = ["envoy.access_loggers.fluentd"],
-    rbe_pool = "6gig",
+    rbe_pool = "linux_x64_small",
     deps = [
         "//source/extensions/access_loggers/fluentd:config",
         "//test/mocks/server:factory_context_mocks",
@@ -31,11 +31,12 @@ envoy_extension_cc_test(
     name = "substitution_formatter_test",
     srcs = ["substitution_formatter_test.cc"],
     extension_names = ["envoy.access_loggers.fluentd"],
-    rbe_pool = "6gig",
+    rbe_pool = "linux_x64_small",
     deps = [
-        "//source/common/formatter:formatter_extension_lib",
+        "//source/common/formatter:http_speicific_formatter_extension_lib",
+        "//source/common/formatter:substitution_format_string_lib",
         "//source/extensions/access_loggers/fluentd:substitution_formatter_lib",
-        "//test/mocks/server:factory_context_mocks",
+        "//test/mocks/stream_info:stream_info_mocks",
         "//test/test_common:environment_lib",
         "//test/test_common:utility_lib",
     ],
@@ -46,7 +47,7 @@ envoy_extension_cc_test(
     size = "large",
     srcs = ["fluentd_access_log_integration_test.cc"],
     extension_names = ["envoy.access_loggers.fluentd"],
-    rbe_pool = "6gig",
+    rbe_pool = "linux_x64_small",
     deps = [
         "//source/extensions/access_loggers/fluentd:config",
         "//source/extensions/filters/network/tcp_proxy:config",

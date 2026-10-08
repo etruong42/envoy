@@ -24,6 +24,7 @@ namespace Envoy {
 namespace {
 
 using OnDemandScopedRdsIntegrationTest = ScopedRdsIntegrationTest;
+using testing::Ge;
 
 INSTANTIATE_TEST_SUITE_P(IpVersionsAndGrpcTypes, OnDemandScopedRdsIntegrationTest,
                          DELTA_SOTW_GRPC_CLIENT_INTEGRATION_PARAMS);
@@ -32,6 +33,8 @@ INSTANTIATE_TEST_SUITE_P(IpVersionsAndGrpcTypes, OnDemandScopedRdsIntegrationTes
 TEST_P(OnDemandScopedRdsIntegrationTest, OnDemandUpdateSuccess) {
   config_helper_.prependFilter(R"EOF(
     name: envoy.filters.http.on_demand
+    typed_config:
+      "@type": type.googleapis.com/envoy.extensions.filters.http.on_demand.v3.OnDemand
     )EOF");
   const std::string scope_route1 = R"EOF(
 name: foo_scope1
@@ -67,7 +70,7 @@ key:
                                      {"Addr", "x-foo-key=foo"}});
   createRdsStream("foo_route1");
   sendRdsResponse(fmt::format(route_config_tmpl, "foo_route1", "cluster_0"), "1");
-  test_server_->waitForCounterGe("http.config_test.rds.foo_route1.update_success", 1);
+  test_server_->waitForCounter("http.config_test.rds.foo_route1.update_success", Ge(1));
 
   waitForNextUpstreamRequest();
   // Send response headers, and end_stream if there is no response body.
@@ -84,6 +87,8 @@ TEST_P(OnDemandScopedRdsIntegrationTest, OnDemandUpdateScopeNotMatch) {
 
   config_helper_.prependFilter(R"EOF(
     name: envoy.filters.http.on_demand
+    typed_config:
+      "@type": type.googleapis.com/envoy.extensions.filters.http.on_demand.v3.OnDemand
     )EOF");
 
   constexpr absl::string_view scope_tmpl = R"EOF(
@@ -134,6 +139,8 @@ TEST_P(OnDemandScopedRdsIntegrationTest, OnDemandUpdatePrimaryVirtualHostNotMatc
 
   config_helper_.prependFilter(R"EOF(
     name: envoy.filters.http.on_demand
+    typed_config:
+      "@type": type.googleapis.com/envoy.extensions.filters.http.on_demand.v3.OnDemand
     )EOF");
 
   constexpr absl::string_view scope_tmpl = R"EOF(
@@ -184,6 +191,8 @@ TEST_P(OnDemandScopedRdsIntegrationTest, OnDemandUpdateVirtualHostNotMatch) {
 
   config_helper_.prependFilter(R"EOF(
     name: envoy.filters.http.on_demand
+    typed_config:
+      "@type": type.googleapis.com/envoy.extensions.filters.http.on_demand.v3.OnDemand
     )EOF");
 
   const std::string scope_route1 = R"EOF(
@@ -238,6 +247,8 @@ key:
 TEST_P(OnDemandScopedRdsIntegrationTest, DifferentPriorityScopeShareRoute) {
   config_helper_.prependFilter(R"EOF(
     name: envoy.filters.http.on_demand
+    typed_config:
+      "@type": type.googleapis.com/envoy.extensions.filters.http.on_demand.v3.OnDemand
     )EOF");
 
   const std::string scope_route1 = R"EOF(
@@ -276,7 +287,7 @@ key:
   initialize();
   registerTestServerPorts({"http"});
   codec_client_ = makeHttpConnection(lookupPort("http"));
-  test_server_->waitForCounterGe("http.config_test.rds.foo_route1.update_success", 1);
+  test_server_->waitForCounter("http.config_test.rds.foo_route1.update_success", Ge(1));
   cleanupUpstreamAndDownstream();
   // "foo" request should succeed because the foo scope is loaded eagerly by default.
   // "bar" request will initialize rds provider on demand and also succeed.
@@ -294,6 +305,8 @@ key:
 TEST_P(OnDemandScopedRdsIntegrationTest, OnDemandUpdateAfterActiveStreamDestroyed) {
   config_helper_.prependFilter(R"EOF(
     name: envoy.filters.http.on_demand
+    typed_config:
+      "@type": type.googleapis.com/envoy.extensions.filters.http.on_demand.v3.OnDemand
     )EOF");
   const std::string scope_route1 = R"EOF(
 name: foo_scope1
@@ -327,21 +340,24 @@ key:
                                      {":authority", "sni.lyft.com"},
                                      {":scheme", "http"},
                                      {"Addr", "x-foo-key=foo"}});
-  test_server_->waitForCounterGe("http.config_test.rds.foo_route1.update_attempt", 1);
+  test_server_->waitForCounter("http.config_test.rds.foo_route1.update_attempt", Ge(1));
   // Close the connection and destroy the active stream.
   cleanupUpstreamAndDownstream();
+  test_server_->waitForWorkerThreads();
   // Push rds update, on demand updated callback is post to worker thread.
   // There is no exception thrown even when active stream is dead because weak_ptr can't be
   // locked.
   createRdsStream("foo_route1");
   sendRdsResponse(fmt::format(route_config_tmpl, "foo_route1", "cluster_0"), "1");
-  test_server_->waitForCounterGe("http.config_test.rds.foo_route1.update_success", 1);
+  test_server_->waitForCounter("http.config_test.rds.foo_route1.update_success", Ge(1));
 }
 
 class OnDemandVhdsIntegrationTest : public VhdsIntegrationTest {
   void initialize() override {
     config_helper_.prependFilter(R"EOF(
     name: envoy.filters.http.on_demand
+    typed_config:
+      "@type": type.googleapis.com/envoy.extensions.filters.http.on_demand.v3.OnDemand
     )EOF");
     VhdsIntegrationTest::initialize();
   }
@@ -809,6 +825,70 @@ TEST_P(OnDemandVhdsIntegrationTest, VhdsWildcardUpgradeOnReconnect) {
                                            {"*", "my_route/vhost.first"}, {}, vhds_stream_.get()));
 }
 
+// End-to-end regression guard for on-demand VHDS after the switch to accept()-based routing: two
+// requests to two DIFFERENT unknown virtual hosts each trigger an on-demand VHDS fetch (via
+// requestOnDemandUpdate()/append()), and both must be routed and resolved. VHDS declares
+// accept("my_route/*") for routing, so on-demand virtual-host names under that route configuration
+// are delivered to the subscription and the requests succeed.
+TEST_P(OnDemandVhdsIntegrationTest, VhdsTwoOnDemandVirtualHostsRouteResponses) {
+  testRouterHeaderOnlyRequestAndResponse(nullptr, 1);
+  cleanupUpstreamAndDownstream();
+  ASSERT_TRUE(codec_client_->waitForDisconnect());
+
+  // First on-demand virtual host: vhost.first.
+  {
+    codec_client_ = makeHttpConnection(makeClientConnection((lookupPort("http"))));
+    Http::TestRequestHeaderMapImpl request_headers{{":method", "GET"},
+                                                   {":path", "/"},
+                                                   {":scheme", "http"},
+                                                   {":authority", "vhost.first"},
+                                                   {"x-lyft-user-id", "123"}};
+    IntegrationStreamDecoderPtr response = codec_client_->makeHeaderOnlyRequest(request_headers);
+    EXPECT_TRUE(compareDeltaDiscoveryRequest(Config::TestTypeUrl::get().VirtualHost,
+                                             {vhdsRequestResourceName("vhost.first")}, {},
+                                             vhds_stream_.get()));
+    sendDeltaDiscoveryResponse<envoy::config::route::v3::VirtualHost>(
+        Config::TestTypeUrl::get().VirtualHost, {buildVirtualHost2()}, {}, "2", vhds_stream_.get(),
+        {"my_route/vhost.first"});
+    EXPECT_TRUE(compareDeltaDiscoveryRequest(Config::TestTypeUrl::get().VirtualHost, {}, {},
+                                             vhds_stream_.get()));
+    waitForNextUpstreamRequest(1);
+    upstream_request_->encodeHeaders(default_response_headers_, true);
+    response->waitForHeaders();
+    EXPECT_EQ("200", response->headers().getStatusValue());
+    cleanupUpstreamAndDownstream();
+    ASSERT_TRUE(codec_client_->waitForDisconnect());
+  }
+
+  // Second on-demand virtual host: vhost.second, a DIFFERENT name -> a second append() on the same
+  // subscription. Its response must also be routed for the request to succeed.
+  {
+    codec_client_ = makeHttpConnection(makeClientConnection((lookupPort("http"))));
+    Http::TestRequestHeaderMapImpl request_headers{{":method", "GET"},
+                                                   {":path", "/"},
+                                                   {":scheme", "http"},
+                                                   {":authority", "vhost.second"},
+                                                   {"x-lyft-user-id", "123"}};
+    IntegrationStreamDecoderPtr response = codec_client_->makeHeaderOnlyRequest(request_headers);
+    EXPECT_TRUE(compareDeltaDiscoveryRequest(Config::TestTypeUrl::get().VirtualHost,
+                                             {vhdsRequestResourceName("vhost.second")}, {},
+                                             vhds_stream_.get()));
+    sendDeltaDiscoveryResponse<envoy::config::route::v3::VirtualHost>(
+        Config::TestTypeUrl::get().VirtualHost,
+        {TestUtility::parseYaml<envoy::config::route::v3::VirtualHost>(
+            virtualHostYaml("my_route/vhost_2", "vhost.second"))},
+        {}, "3", vhds_stream_.get(), {"my_route/vhost.second"});
+    EXPECT_TRUE(compareDeltaDiscoveryRequest(Config::TestTypeUrl::get().VirtualHost, {}, {},
+                                             vhds_stream_.get()));
+    waitForNextUpstreamRequest(1);
+    upstream_request_->encodeHeaders(default_response_headers_, true);
+    response->waitForHeaders();
+    EXPECT_EQ("200", response->headers().getStatusValue());
+    cleanupUpstreamAndDownstream();
+    ASSERT_TRUE(codec_client_->waitForDisconnect());
+  }
+}
+
 // Test class for VHDS on-demand updates with request bodies
 class OnDemandVhdsWithBodyIntegrationTest
     : public testing::TestWithParam<std::tuple<HttpProtocolTestParams, VhdsIntegrationTestParam>>,
@@ -838,6 +918,8 @@ public:
                                       isUnified() ? "true" : "false");
     config_helper_.prependFilter(R"EOF(
     name: envoy.filters.http.on_demand
+    typed_config:
+      "@type": type.googleapis.com/envoy.extensions.filters.http.on_demand.v3.OnDemand
     )EOF");
   }
 
@@ -919,7 +1001,7 @@ routes:
             ->set_cluster_name("xds_cluster");
       }
 
-      config_blob->PackFrom(hcm_config);
+      std::ignore = config_blob->PackFrom(hcm_config);
     });
 
     HttpIntegrationTest::initialize();

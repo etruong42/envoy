@@ -56,6 +56,8 @@ fn new_access_logger_config_fn(
 struct TestAccessLoggerConfig {
   _name: String,
   log_counter: CounterHandle,
+  downstream_bytes_received: CounterHandle,
+  downstream_bytes_sent: CounterHandle,
 }
 
 impl AccessLoggerConfig for TestAccessLoggerConfig {
@@ -64,9 +66,23 @@ impl AccessLoggerConfig for TestAccessLoggerConfig {
     let log_counter = ctx
       .define_counter("test_log_count")
       .ok_or("Failed to define counter")?;
+    let downstream_bytes_received = ctx
+      .define_counter("test_downstream_wire_bytes_received")
+      .ok_or("Failed to define downstream received counter")?;
+    let downstream_bytes_sent = ctx
+      .define_counter("test_downstream_wire_bytes_sent")
+      .ok_or("Failed to define downstream sent counter")?;
+    // Emit a metric directly from the config context (no log event), exercising the config-scoped
+    // emission path. This would typically be done from a scheduled background task.
+    let config_total = ctx
+      .define_counter("config_total")
+      .ok_or("Failed to define config counter")?;
+    ctx.increment_counter(config_total, 1);
     Ok(Self {
       _name: name.to_string(),
       log_counter,
+      downstream_bytes_received,
+      downstream_bytes_sent,
     })
   }
 
@@ -81,6 +97,8 @@ impl AccessLoggerConfig for TestAccessLoggerConfig {
     Box::new(TestAccessLogger {
       pending_logs: 0,
       log_counter: self.log_counter,
+      downstream_bytes_received: self.downstream_bytes_received,
+      downstream_bytes_sent: self.downstream_bytes_sent,
       metrics,
     })
   }
@@ -90,6 +108,8 @@ impl AccessLoggerConfig for TestAccessLoggerConfig {
 struct TestAccessLogger {
   pending_logs: u32,
   log_counter: CounterHandle,
+  downstream_bytes_received: CounterHandle,
+  downstream_bytes_sent: CounterHandle,
   metrics: MetricsContext,
 }
 
@@ -106,9 +126,39 @@ impl AccessLogger for TestAccessLogger {
     let _response_code = ctx.response_code();
     let _protocol = ctx.protocol();
     let _route_name = ctx.route_name();
+    assert_eq!(
+      ctx
+        .get_attribute_string(abi::envoy_dynamic_module_type_attribute_id::XdsVirtualHostName)
+        .unwrap()
+        .as_slice(),
+      b"test_vhost"
+    );
+    if ctx.response_code() == Some(400) {
+      // The direct response is generated before the router selects a virtual cluster.
+      assert!(ctx.virtual_cluster_name().is_none());
+    } else {
+      assert_eq!(
+        ctx.virtual_cluster_name().unwrap().as_slice(),
+        b"test_vcluster"
+      );
+    }
     let _is_health_check = ctx.is_health_check();
     let _timing = ctx.timing_info();
-    let _bytes = ctx.bytes_info();
+    let bytes = ctx.bytes_info();
+    let downstream = ctx.downstream_wire_bytes();
+    // These header-only requests still have downstream wire bytes, including local replies.
+    assert!(downstream.bytes_received > bytes.bytes_received);
+    assert!(downstream.bytes_sent > bytes.bytes_sent);
+    if ctx.response_code() == Some(400) {
+      assert_eq!(bytes.wire_bytes_received, 0);
+      assert_eq!(bytes.wire_bytes_sent, 0);
+    }
+    self
+      .metrics
+      .increment_counter(self.downstream_bytes_received, downstream.bytes_received);
+    self
+      .metrics
+      .increment_counter(self.downstream_bytes_sent, downstream.bytes_sent);
 
     // Test worker id.
     let worker_id = ctx.get_worker_index();
@@ -139,6 +189,11 @@ impl AccessLogger for TestAccessLogger {
     // Test request ID and metadata.
     let _request_id = ctx.request_id();
     let _filter_state = ctx.get_filter_state("test_key");
+
+    // Test typed dynamic metadata accessors.
+    let _dm_string = ctx.get_dynamic_metadata("test_filter", "string_key");
+    let _dm_number = ctx.get_dynamic_metadata_number("test_filter", "handshake_state");
+    let _dm_bool = ctx.get_dynamic_metadata_bool("test_filter", "tls_enabled");
 
     // Test tracing (stubs that always return None).
     let _trace_id = ctx.get_trace_id();

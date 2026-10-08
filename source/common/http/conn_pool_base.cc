@@ -104,24 +104,6 @@ void HttpConnPoolImplBase::onPoolReady(Envoy::ConnectionPool::ActiveClient& clie
                         http_client->codec_client_->protocol());
 }
 
-void HttpConnPoolImplBase::setLifetimeCallbacks(
-    OptRef<ConnectionPool::ConnectionLifetimeCallbacks> callbacks, std::vector<uint8_t> hash_key) {
-  callbacks_ = callbacks;
-  hash_key_ = std::move(hash_key);
-}
-
-void HttpConnPoolImplBase::onConnectionOpen(const Network::Connection& connection) {
-  if (callbacks_.has_value()) {
-    callbacks_->onConnectionOpen(*this, hash_key_, connection);
-  }
-}
-
-void HttpConnPoolImplBase::onConnectionDraining(const Network::Connection& connection) {
-  if (callbacks_.has_value()) {
-    callbacks_->onConnectionDraining(*this, hash_key_, connection);
-  }
-}
-
 // All streams are 2^31. Client streams are half that, minus stream 0. Just to be on the safe
 // side we do 2^29.
 constexpr uint32_t DEFAULT_MAX_STREAMS = 1U << 29;
@@ -133,7 +115,6 @@ void MultiplexedActiveClientBase::onGoAway(Http::GoAwayErrorCode) {
     if (codec_client_->numActiveRequests() == 0) {
       codec_client_->close();
     } else {
-      parent().onConnectionDraining(codec_client_->connection());
       parent_.transitionActiveClientState(*this, ActiveClient::State::Draining);
     }
   }
@@ -148,9 +129,7 @@ void MultiplexedActiveClientBase::onGoAway(Http::GoAwayErrorCode) {
 // received, but that would result in a latency penalty instead.
 void MultiplexedActiveClientBase::onSettings(ReceivedSettings& settings) {
   if (settings.maxConcurrentStreams().has_value()) {
-    int64_t old_unused_capacity = currentUnusedCapacity();
-    // Given config limits old_unused_capacity should never exceed int32_t.
-    ASSERT(std::numeric_limits<int32_t>::max() >= old_unused_capacity);
+    uint32_t old_pool_contribution = currentUnusedCapacity();
     if (parent().cache() && parent().origin().has_value()) {
       parent().cache()->setConcurrentStreams(*parent().origin(),
                                              settings.maxConcurrentStreams().value());
@@ -158,19 +137,27 @@ void MultiplexedActiveClientBase::onSettings(ReceivedSettings& settings) {
     concurrent_stream_limit_ =
         std::min(settings.maxConcurrentStreams().value(), configured_stream_limit_);
 
-    int64_t delta = old_unused_capacity - currentUnusedCapacity();
-    if (state() == ActiveClient::State::Ready && currentUnusedCapacity() <= 0) {
+    // Compute raw signed capacity to determine debt (the negative portion not tracked in pool).
+    int64_t new_raw_capacity = static_cast<int64_t>(concurrent_stream_limit_) - numActiveStreams();
+    new_raw_capacity = std::min<int64_t>(remaining_streams_, new_raw_capacity);
+    uint32_t new_pool_contribution = static_cast<uint32_t>(std::max<int64_t>(0, new_raw_capacity));
+
+    if (state() == ActiveClient::State::Ready && new_raw_capacity <= 0) {
       parent_.transitionActiveClientState(*this, ActiveClient::State::Busy);
-    } else if (state() == ActiveClient::State::Busy && currentUnusedCapacity() > 0) {
+    } else if (state() == ActiveClient::State::Busy && new_raw_capacity > 0) {
       parent_.transitionActiveClientState(*this, ActiveClient::State::Ready);
     }
 
-    if (delta > 0) {
-      parent_.decrClusterStreamCapacity(delta);
-      ENVOY_CONN_LOG(trace, "Decreasing stream capacity by {}", *codec_client_, delta);
-    } else if (delta < 0) {
-      parent_.incrClusterStreamCapacity(-delta);
-      ENVOY_CONN_LOG(trace, "Increasing stream capacity by {}", *codec_client_, -delta);
+    capacity_debt_ = static_cast<uint32_t>(std::max<int64_t>(0, -new_raw_capacity));
+
+    if (old_pool_contribution > new_pool_contribution) {
+      uint32_t pool_delta = old_pool_contribution - new_pool_contribution;
+      parent_.decrClusterStreamCapacity(pool_delta);
+      ENVOY_CONN_LOG(trace, "Decreasing stream capacity by {}", *codec_client_, pool_delta);
+    } else if (new_pool_contribution > old_pool_contribution) {
+      uint32_t pool_delta = new_pool_contribution - old_pool_contribution;
+      parent_.incrClusterStreamCapacity(pool_delta);
+      ENVOY_CONN_LOG(trace, "Increasing stream capacity by {}", *codec_client_, pool_delta);
     }
   }
 }
@@ -202,6 +189,9 @@ void MultiplexedActiveClientBase::onStreamReset(Http::StreamResetReason reason) 
     break;
   case StreamResetReason::RemoteReset:
     parent_.host()->cluster().trafficStats()->upstream_rq_rx_reset_.inc();
+    break;
+  case StreamResetReason::RemoteResetNoError:
+    parent_.host()->cluster().trafficStats()->upstream_rq_rx_reset_no_error_.inc();
     break;
   case StreamResetReason::LocalRefusedStreamReset:
   case StreamResetReason::RemoteRefusedStreamReset:
@@ -239,18 +229,6 @@ RequestEncoder& MultiplexedActiveClientBase::newStreamEncoder(ResponseDecoder& r
 RequestEncoder&
 MultiplexedActiveClientBase::newStreamEncoder(ResponseDecoderHandlePtr response_decoder_handle) {
   return codec_client_->newStream(std::move(response_decoder_handle));
-}
-
-void MultiplexedActiveClientBase::onEvent(Network::ConnectionEvent event) {
-  if (event == Network::ConnectionEvent::Connected ||
-      event == Network::ConnectionEvent::ConnectedZeroRtt) {
-    parent().onConnectionOpen(codec_client_->connection());
-  } else if (event == Network::ConnectionEvent::LocalClose ||
-             event == Network::ConnectionEvent::RemoteClose) {
-    parent().onConnectionDraining(codec_client_->connection());
-  }
-
-  ActiveClient::onEvent(event);
 }
 
 } // namespace Http

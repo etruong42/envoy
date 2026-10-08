@@ -12,12 +12,18 @@
 #include "test/extensions/filters/common/lua/lua_wrappers.h"
 #include "test/mocks/router/mocks.h"
 #include "test/mocks/stream_info/mocks.h"
+#include "test/test_common/status_utility.h"
+#include "test/test_common/struct_matchers.h"
 #include "test/test_common/utility.h"
 
+using testing::Contains;
+using testing::ElementsAre;
 using testing::Expectation;
 using testing::InSequence;
+using testing::IsSupersetOf;
 using testing::ReturnPointee;
 using testing::ReturnRef;
+using testing::UnorderedElementsAre;
 
 namespace Envoy {
 namespace Extensions {
@@ -30,6 +36,13 @@ public:
   void setup(const std::string& script) override {
     Filters::Common::Lua::LuaWrappersTestBase<HeaderMapWrapper>::setup(script);
     state_->registerType<HeaderMapIterator>();
+  }
+
+protected:
+  Filters::Common::Lua::LuaDeathRef<HeaderMapWrapper>
+  createWrapperRef(Http::HeaderMap& headers, HeaderMapWrapper::CheckModifiableCb cb) {
+    return Filters::Common::Lua::LuaDeathRef<HeaderMapWrapper>(
+        HeaderMapWrapper::create(coroutine_->luaState(), headers, cb), true);
   }
 };
 
@@ -62,7 +75,7 @@ TEST_F(LuaHeaderMapWrapperTest, Methods) {
   setup(SCRIPT);
 
   Http::TestRequestHeaderMapImpl headers;
-  HeaderMapWrapper::create(coroutine_->luaState(), headers, []() { return true; });
+  auto wrapper = createWrapperRef(headers, []() { return true; });
   EXPECT_CALL(printer_, testPrint("WORLD"));
   EXPECT_CALL(printer_, testPrint("'hello' 'WORLD'"));
   EXPECT_CALL(printer_, testPrint("'header1' ''"));
@@ -70,7 +83,8 @@ TEST_F(LuaHeaderMapWrapperTest, Methods) {
   EXPECT_CALL(printer_, testPrint("'hello' 'WORLD'"));
   EXPECT_CALL(printer_, testPrint("'header2' 'foo'"));
   EXPECT_CALL(printer_, testPrint("foo,bar"));
-  start("callMe");
+  EXPECT_OK(start("callMe"));
+  wrapper.reset();
 }
 
 // Get the total number of values for a certain header with multiple values.
@@ -87,11 +101,12 @@ TEST_F(LuaHeaderMapWrapperTest, GetNumValues) {
   setup(SCRIPT);
 
   Http::TestRequestHeaderMapImpl headers{{":path", "/"}, {"x-test", "foo"}, {"x-test", "bar"}};
-  HeaderMapWrapper::create(coroutine_->luaState(), headers, []() { return true; });
+  auto wrapper = createWrapperRef(headers, []() { return true; });
   EXPECT_CALL(printer_, testPrint("2"));
   EXPECT_CALL(printer_, testPrint("1"));
   EXPECT_CALL(printer_, testPrint("0"));
-  start("callMe");
+  EXPECT_OK(start("callMe"));
+  wrapper.reset();
 }
 
 // Get the value on a certain index for a header with multiple values.
@@ -115,13 +130,14 @@ TEST_F(LuaHeaderMapWrapperTest, GetAtIndex) {
 
   Http::TestRequestHeaderMapImpl headers{
       {":path", "/"}, {"x-test", "foo"}, {"x-test", "bar"}, {"x-test", ""}};
-  HeaderMapWrapper::create(coroutine_->luaState(), headers, []() { return true; });
+  auto wrapper = createWrapperRef(headers, []() { return true; });
   EXPECT_CALL(printer_, testPrint("invalid_negative_index"));
   EXPECT_CALL(printer_, testPrint("foo"));
   EXPECT_CALL(printer_, testPrint("bar"));
   EXPECT_CALL(printer_, testPrint(""));
   EXPECT_CALL(printer_, testPrint("nil_value"));
-  start("callMe");
+  EXPECT_OK(start("callMe"));
+  wrapper.reset();
 }
 
 // Test modifiable methods.
@@ -150,23 +166,30 @@ TEST_F(LuaHeaderMapWrapperTest, ModifiableMethods) {
   setup(SCRIPT);
 
   Http::TestRequestHeaderMapImpl headers;
-  HeaderMapWrapper::create(coroutine_->luaState(), headers, []() { return false; });
-  start("shouldBeOk");
+  auto should_be_ok_wrapper = createWrapperRef(headers, []() { return false; });
+  EXPECT_OK(start("shouldBeOk"));
+  should_be_ok_wrapper.reset();
 
   setup(SCRIPT);
-  HeaderMapWrapper::create(coroutine_->luaState(), headers, []() { return false; });
-  EXPECT_THROW_WITH_MESSAGE(start("shouldFailRemove"), Filters::Common::Lua::LuaException,
-                            "[string \"...\"]:9: header map can no longer be modified");
+  auto should_fail_remove_wrapper = createWrapperRef(headers, []() { return false; });
+  EXPECT_THAT(
+      start("shouldFailRemove"),
+      StatusHelpers::HasStatusMessage("[string \"...\"]:9: header map can no longer be modified"));
+  should_fail_remove_wrapper.reset();
 
   setup(SCRIPT);
-  HeaderMapWrapper::create(coroutine_->luaState(), headers, []() { return false; });
-  EXPECT_THROW_WITH_MESSAGE(start("shouldFailAdd"), Filters::Common::Lua::LuaException,
-                            "[string \"...\"]:13: header map can no longer be modified");
+  auto should_fail_add_wrapper = createWrapperRef(headers, []() { return false; });
+  EXPECT_THAT(
+      start("shouldFailAdd"),
+      StatusHelpers::HasStatusMessage("[string \"...\"]:13: header map can no longer be modified"));
+  should_fail_add_wrapper.reset();
 
   setup(SCRIPT);
-  HeaderMapWrapper::create(coroutine_->luaState(), headers, []() { return false; });
-  EXPECT_THROW_WITH_MESSAGE(start("shouldFailReplace"), Filters::Common::Lua::LuaException,
-                            "[string \"...\"]:17: header map can no longer be modified");
+  auto should_fail_replace_wrapper = createWrapperRef(headers, []() { return false; });
+  EXPECT_THAT(
+      start("shouldFailReplace"),
+      StatusHelpers::HasStatusMessage("[string \"...\"]:17: header map can no longer be modified"));
+  should_fail_replace_wrapper.reset();
 }
 
 // Verify that replace works correctly with both inline and normal headers.
@@ -183,8 +206,9 @@ TEST_F(LuaHeaderMapWrapperTest, Replace) {
   setup(SCRIPT);
 
   Http::TestRequestHeaderMapImpl headers{{":path", "/"}, {"other_header", "hello"}};
-  HeaderMapWrapper::create(coroutine_->luaState(), headers, []() { return true; });
-  start("callMe");
+  auto wrapper = createWrapperRef(headers, []() { return true; });
+  EXPECT_OK(start("callMe"));
+  wrapper.reset();
 
   EXPECT_EQ((Http::TestRequestHeaderMapImpl{{":path", "/new_path"},
                                             {"other_header", "other_header_value"},
@@ -206,9 +230,11 @@ TEST_F(LuaHeaderMapWrapperTest, ModifyDuringIteration) {
   setup(SCRIPT);
 
   Http::TestRequestHeaderMapImpl headers{{"foo", "bar"}};
-  HeaderMapWrapper::create(coroutine_->luaState(), headers, []() { return true; });
-  EXPECT_THROW_WITH_MESSAGE(start("callMe"), Filters::Common::Lua::LuaException,
-                            "[string \"...\"]:4: header map cannot be modified while iterating");
+  auto wrapper = createWrapperRef(headers, []() { return true; });
+  EXPECT_THAT(start("callMe"),
+              StatusHelpers::HasStatusMessage(
+                  "[string \"...\"]:4: header map cannot be modified while iterating"));
+  wrapper.reset();
 }
 
 // Modify after iteration.
@@ -231,11 +257,12 @@ TEST_F(LuaHeaderMapWrapperTest, ModifyAfterIteration) {
   setup(SCRIPT);
 
   Http::TestRequestHeaderMapImpl headers{{"foo", "bar"}};
-  HeaderMapWrapper::create(coroutine_->luaState(), headers, []() { return true; });
+  auto wrapper = createWrapperRef(headers, []() { return true; });
   EXPECT_CALL(printer_, testPrint("'foo' 'bar'"));
   EXPECT_CALL(printer_, testPrint("'foo' 'bar'"));
   EXPECT_CALL(printer_, testPrint("'hello' 'world'"));
-  start("callMe");
+  EXPECT_OK(start("callMe"));
+  wrapper.reset();
 }
 
 // Don't finish iteration.
@@ -252,10 +279,12 @@ TEST_F(LuaHeaderMapWrapperTest, DontFinishIteration) {
   setup(SCRIPT);
 
   Http::TestRequestHeaderMapImpl headers{{"foo", "bar"}, {"hello", "world"}};
-  HeaderMapWrapper::create(coroutine_->luaState(), headers, []() { return true; });
-  EXPECT_THROW_WITH_MESSAGE(
-      start("callMe"), Filters::Common::Lua::LuaException,
-      "[string \"...\"]:5: cannot create a second iterator before completing the first");
+  auto wrapper = createWrapperRef(headers, []() { return true; });
+  EXPECT_THAT(
+      start("callMe"),
+      StatusHelpers::HasStatusMessage(
+          "[string \"...\"]:5: cannot create a second iterator before completing the first"));
+  wrapper.reset();
 }
 
 // Use iterator across yield.
@@ -272,13 +301,13 @@ TEST_F(LuaHeaderMapWrapperTest, IteratorAcrossYield) {
   setup(SCRIPT);
 
   Http::TestRequestHeaderMapImpl headers{{"foo", "bar"}, {"hello", "world"}};
-  Filters::Common::Lua::LuaDeathRef<HeaderMapWrapper> wrapper(
-      HeaderMapWrapper::create(coroutine_->luaState(), headers, []() { return true; }), true);
-  yield_callback_ = [] {};
-  start("callMe");
+  auto wrapper = createWrapperRef(headers, []() { return true; });
+  yield_callback_ = [] { return absl::OkStatus(); };
+  EXPECT_OK(start("callMe"));
   wrapper.reset();
-  EXPECT_THROW_WITH_MESSAGE(coroutine_->resume(0, [] {}), Filters::Common::Lua::LuaException,
-                            "[string \"...\"]:5: object used outside of proper scope");
+  EXPECT_THAT(
+      coroutine_->resume(0, [] { return absl::OkStatus(); }),
+      StatusHelpers::HasStatusMessage("[string \"...\"]:5: object used outside of proper scope"));
 }
 
 // Verify setting the HTTP1 reason phrase
@@ -293,8 +322,9 @@ TEST_F(LuaHeaderMapWrapperTest, SetHttp1ReasonPhrase) {
   setup(SCRIPT);
 
   auto headers = Http::ResponseHeaderMapImpl::create();
-  HeaderMapWrapper::create(coroutine_->luaState(), *headers, []() { return true; });
-  start("callMe");
+  auto wrapper = createWrapperRef(*headers, []() { return true; });
+  EXPECT_OK(start("callMe"));
+  wrapper.reset();
 
   Http::StatefulHeaderKeyFormatterOptRef formatter(headers->formatter());
   EXPECT_EQ(true, formatter.has_value());
@@ -312,7 +342,7 @@ public:
   }
 
 protected:
-  void expectToPrintCurrentProtocol(const absl::optional<Envoy::Http::Protocol>& protocol) {
+  void expectToPrintCurrentProtocol(const std::optional<Envoy::Http::Protocol>& protocol) {
     const std::string SCRIPT{R"EOF(
       function callMe(object)
         testPrint(string.format("'%s'", object:protocol()))
@@ -328,7 +358,7 @@ protected:
         StreamInfoWrapper::create(coroutine_->luaState(), stream_info), true);
     EXPECT_CALL(printer_,
                 testPrint(fmt::format("'{}'", Http::Utility::getProtocolString(protocol.value()))));
-    start("callMe");
+    EXPECT_OK(start("callMe"));
     wrapper.reset();
   }
 
@@ -378,7 +408,7 @@ TEST_F(LuaStreamInfoWrapperTest, ReturnCurrentDownstreamAddresses) {
   EXPECT_CALL(printer_, testPrint(address->asString()));
   EXPECT_CALL(printer_, testPrint(downstream_direct_remote->asString()));
   EXPECT_CALL(printer_, testPrint(downstream_remote->asString()));
-  start("callMe");
+  EXPECT_OK(start("callMe"));
   wrapper.reset();
 }
 
@@ -397,7 +427,7 @@ TEST_F(LuaStreamInfoWrapperTest, ReturnRequestedServerName) {
   Filters::Common::Lua::LuaDeathRef<StreamInfoWrapper> wrapper(
       StreamInfoWrapper::create(coroutine_->luaState(), stream_info), true);
   EXPECT_CALL(printer_, testPrint("some.sni.io"));
-  start("callMe");
+  EXPECT_OK(start("callMe"));
   wrapper.reset();
 }
 
@@ -444,7 +474,7 @@ TEST_F(LuaStreamInfoWrapperTest, SetGetAndIterateDynamicMetadata) {
   EXPECT_CALL(printer_, testPrint("'so' 'cool'"));
   EXPECT_CALL(printer_, testPrint("yes"));
   EXPECT_CALL(printer_, testPrint("0"));
-  start("callMe");
+  EXPECT_OK(start("callMe"));
 
   EXPECT_EQ(1, stream_info.dynamicMetadata().filter_metadata_size());
   EXPECT_EQ("bar", stream_info.dynamicMetadata()
@@ -495,7 +525,7 @@ TEST_F(LuaStreamInfoWrapperTest, GetDynamicMetadataBinaryData) {
   EXPECT_CALL(printer_, testPrint("Hex Data: 6c")).Times(2); // l (Hex: 6c)
   EXPECT_CALL(printer_, testPrint("Hex Data: 6f"));          // 0 (Hex: 6f)
 
-  start("callMe");
+  EXPECT_OK(start("callMe"));
 }
 
 // Set, get complex key/values in stream info dynamic metadata.
@@ -530,7 +560,7 @@ TEST_F(LuaStreamInfoWrapperTest, SetGetComplexDynamicMetadata) {
   EXPECT_CALL(printer_, testPrint("and"));
   EXPECT_CALL(printer_, testPrint("dynamic"));
   EXPECT_CALL(printer_, testPrint("true"));
-  start("callMe");
+  EXPECT_OK(start("callMe"));
 
   EXPECT_EQ(1, stream_info.dynamicMetadata().filter_metadata_size());
   const Protobuf::Struct& meta_foo = stream_info.dynamicMetadata()
@@ -540,18 +570,16 @@ TEST_F(LuaStreamInfoWrapperTest, SetGetComplexDynamicMetadata) {
                                          .at("foo")
                                          .struct_value();
 
-  EXPECT_EQ(1234.0, meta_foo.fields().at("x").number_value());
-  EXPECT_EQ("baz", meta_foo.fields().at("y").string_value());
-  EXPECT_EQ(true, meta_foo.fields().at("z").bool_value());
+  EXPECT_THAT(meta_foo.fields(),
+              UnorderedElementsAre(IsStructNumber("x", 1234.0), IsStructString("y", "baz"),
+                                   IsStructBool("z", true)));
 
   const Protobuf::ListValue& meta_so =
       stream_info.dynamicMetadata().filter_metadata().at("envoy.lb").fields().at("so").list_value();
 
-  EXPECT_EQ(4, meta_so.values_size());
-  EXPECT_EQ("cool", meta_so.values(0).string_value());
-  EXPECT_EQ("and", meta_so.values(1).string_value());
-  EXPECT_EQ("dynamic", meta_so.values(2).string_value());
-  EXPECT_EQ(true, meta_so.values(3).bool_value());
+  EXPECT_THAT(meta_so.values(),
+              ElementsAre(IsStructValueString("cool"), IsStructValueString("and"),
+                          IsStructValueString("dynamic"), IsStructValueBool(true)));
 
   wrapper.reset();
 }
@@ -571,8 +599,9 @@ TEST_F(LuaStreamInfoWrapperTest, BadTypesInTableForDynamicMetadata) {
                                          StreamInfo::FilterState::LifeSpan::FilterChain);
   Filters::Common::Lua::LuaDeathRef<StreamInfoWrapper> wrapper(
       StreamInfoWrapper::create(coroutine_->luaState(), stream_info), true);
-  EXPECT_THROW_WITH_MESSAGE(start("callMe"), Filters::Common::Lua::LuaException,
-                            "[string \"...\"]:3: unexpected type 'function' in dynamicMetadata");
+  EXPECT_THAT(start("callMe"),
+              StatusHelpers::HasStatusMessage(
+                  "[string \"...\"]:3: unexpected type 'function' in dynamicMetadata"));
 }
 
 // Modify during iteration.
@@ -593,9 +622,9 @@ TEST_F(LuaStreamInfoWrapperTest, ModifyDuringIterationForDynamicMetadata) {
                                          StreamInfo::FilterState::LifeSpan::FilterChain);
   Filters::Common::Lua::LuaDeathRef<StreamInfoWrapper> wrapper(
       StreamInfoWrapper::create(coroutine_->luaState(), stream_info), true);
-  EXPECT_THROW_WITH_MESSAGE(
-      start("callMe"), Filters::Common::Lua::LuaException,
-      "[string \"...\"]:5: dynamic metadata map cannot be modified while iterating");
+  EXPECT_THAT(start("callMe"),
+              StatusHelpers::HasStatusMessage(
+                  "[string \"...\"]:5: dynamic metadata map cannot be modified while iterating"));
 }
 
 // Modify after iteration.
@@ -633,7 +662,7 @@ TEST_F(LuaStreamInfoWrapperTest, ModifyAfterIterationForDynamicMetadata) {
   Expectation expect_2 = EXPECT_CALL(printer_, testPrint("modified")).After(expect_1);
   EXPECT_CALL(printer_, testPrint("'envoy.proxy' 'proto' 'grpc'")).After(expect_2);
   EXPECT_CALL(printer_, testPrint("'envoy.lb' 'hello' 'envoy'")).After(expect_2);
-  start("callMe");
+  EXPECT_OK(start("callMe"));
 }
 
 // Don't finish iteration.
@@ -654,9 +683,10 @@ TEST_F(LuaStreamInfoWrapperTest, DontFinishIterationForDynamicMetadata) {
                                          StreamInfo::FilterState::LifeSpan::FilterChain);
   Filters::Common::Lua::LuaDeathRef<StreamInfoWrapper> wrapper(
       StreamInfoWrapper::create(coroutine_->luaState(), stream_info), true);
-  EXPECT_THROW_WITH_MESSAGE(
-      start("callMe"), Filters::Common::Lua::LuaException,
-      "[string \"...\"]:6: cannot create a second iterator before completing the first");
+  EXPECT_THAT(
+      start("callMe"),
+      StatusHelpers::HasStatusMessage(
+          "[string \"...\"]:6: cannot create a second iterator before completing the first"));
 }
 
 // Test for getting the route name
@@ -677,7 +707,7 @@ TEST_F(LuaStreamInfoWrapperTest, GetRouteName) {
   Filters::Common::Lua::LuaDeathRef<StreamInfoWrapper> wrapper(
       StreamInfoWrapper::create(coroutine_->luaState(), stream_info), true);
   EXPECT_CALL(printer_, testPrint("test_route"));
-  start("callMe");
+  EXPECT_OK(start("callMe"));
   wrapper.reset();
 }
 
@@ -699,7 +729,7 @@ TEST_F(LuaStreamInfoWrapperTest, GetEmptyRouteName) {
   Filters::Common::Lua::LuaDeathRef<StreamInfoWrapper> wrapper(
       StreamInfoWrapper::create(coroutine_->luaState(), stream_info), true);
   EXPECT_CALL(printer_, testPrint(""));
-  start("callMe");
+  EXPECT_OK(start("callMe"));
   wrapper.reset();
 }
 
@@ -714,13 +744,13 @@ TEST_F(LuaStreamInfoWrapperTest, GetVirtualClusterName) {
   setup(SCRIPT);
 
   NiceMock<Envoy::StreamInfo::MockStreamInfo> stream_info;
-  const absl::optional<std::string> name = absl::make_optional<std::string>("test_virtual_cluster");
+  const std::optional<std::string> name = std::make_optional<std::string>("test_virtual_cluster");
   ON_CALL(stream_info, virtualClusterName()).WillByDefault(testing::ReturnRef(name));
 
   Filters::Common::Lua::LuaDeathRef<StreamInfoWrapper> wrapper(
       StreamInfoWrapper::create(coroutine_->luaState(), stream_info), true);
   EXPECT_CALL(printer_, testPrint("test_virtual_cluster"));
-  start("callMe");
+  EXPECT_OK(start("callMe"));
   wrapper.reset();
 }
 
@@ -735,13 +765,13 @@ TEST_F(LuaStreamInfoWrapperTest, GetEmptyVirtualClusterName) {
   setup(SCRIPT);
 
   NiceMock<Envoy::StreamInfo::MockStreamInfo> stream_info;
-  const absl::optional<std::string> name = absl::nullopt;
+  const std::optional<std::string> name = std::nullopt;
   ON_CALL(stream_info, virtualClusterName()).WillByDefault(testing::ReturnRef(name));
 
   Filters::Common::Lua::LuaDeathRef<StreamInfoWrapper> wrapper(
       StreamInfoWrapper::create(coroutine_->luaState(), stream_info), true);
   EXPECT_CALL(printer_, testPrint(""));
-  start("callMe");
+  EXPECT_OK(start("callMe"));
   wrapper.reset();
 }
 
@@ -771,7 +801,7 @@ TEST_F(LuaStreamInfoWrapperTest, GetDynamicTypedMetadataBasic) {
 
   Protobuf::Any any_metadata;
   any_metadata.set_type_url("type.googleapis.com/google.protobuf.Struct");
-  any_metadata.PackFrom(test_struct);
+  std::ignore = any_metadata.PackFrom(test_struct);
 
   (*stream_info.metadata_.mutable_typed_filter_metadata())["envoy.test.metadata"] = any_metadata;
 
@@ -779,7 +809,7 @@ TEST_F(LuaStreamInfoWrapperTest, GetDynamicTypedMetadataBasic) {
       StreamInfoWrapper::create(coroutine_->luaState(), stream_info), true);
   EXPECT_CALL(printer_, testPrint("found_metadata"));
   EXPECT_CALL(printer_, testPrint("test_value"));
-  start("callMe");
+  EXPECT_OK(start("callMe"));
   wrapper.reset();
 }
 
@@ -805,7 +835,7 @@ TEST_F(LuaStreamInfoWrapperTest, GetDynamicTypedMetadataMissing) {
   Filters::Common::Lua::LuaDeathRef<StreamInfoWrapper> wrapper(
       StreamInfoWrapper::create(coroutine_->luaState(), stream_info), true);
   EXPECT_CALL(printer_, testPrint("metadata_not_found"));
-  start("callMe");
+  EXPECT_OK(start("callMe"));
   wrapper.reset();
 }
 
@@ -850,7 +880,7 @@ TEST_F(LuaStreamInfoWrapperTest, GetDynamicTypedMetadataComplexStructure) {
 
   Protobuf::Any any_metadata;
   any_metadata.set_type_url("type.googleapis.com/google.protobuf.Struct");
-  any_metadata.PackFrom(complex_struct);
+  std::ignore = any_metadata.PackFrom(complex_struct);
 
   (*stream_info.metadata_.mutable_typed_filter_metadata())["envoy.complex.metadata"] = any_metadata;
 
@@ -861,7 +891,7 @@ TEST_F(LuaStreamInfoWrapperTest, GetDynamicTypedMetadataComplexStructure) {
   EXPECT_CALL(printer_, testPrint("42.5"));
   EXPECT_CALL(printer_, testPrint("first"));
   EXPECT_CALL(printer_, testPrint("second"));
-  start("callMe");
+  EXPECT_OK(start("callMe"));
   wrapper.reset();
 }
 
@@ -894,7 +924,7 @@ TEST_F(LuaStreamInfoWrapperTest, GetDynamicTypedMetadataInvalidTypeUrl) {
   Filters::Common::Lua::LuaDeathRef<StreamInfoWrapper> wrapper(
       StreamInfoWrapper::create(coroutine_->luaState(), stream_info), true);
   EXPECT_CALL(printer_, testPrint("invalid_type_url_handled"));
-  start("callMe");
+  EXPECT_OK(start("callMe"));
   wrapper.reset();
 }
 
@@ -928,7 +958,7 @@ TEST_F(LuaStreamInfoWrapperTest, GetDynamicTypedMetadataUnpackFailure) {
   Filters::Common::Lua::LuaDeathRef<StreamInfoWrapper> wrapper(
       StreamInfoWrapper::create(coroutine_->luaState(), stream_info), true);
   EXPECT_CALL(printer_, testPrint("unpack_failure_handled"));
-  start("callMe");
+  EXPECT_OK(start("callMe"));
   wrapper.reset();
 }
 
@@ -969,7 +999,7 @@ TEST_F(LuaStreamInfoWrapperTest, IterateDynamicTypedMetadata) {
   (*struct1.mutable_fields())["field_one"].set_string_value("value_one");
   Protobuf::Any any1;
   any1.set_type_url("type.googleapis.com/google.protobuf.Struct");
-  any1.PackFrom(struct1);
+  std::ignore = any1.PackFrom(struct1);
   (*stream_info.metadata_.mutable_typed_filter_metadata())["envoy.metadata.one"] = any1;
 
   // Create second metadata entry
@@ -977,7 +1007,7 @@ TEST_F(LuaStreamInfoWrapperTest, IterateDynamicTypedMetadata) {
   (*struct2.mutable_fields())["field_two"].set_string_value("value_two");
   Protobuf::Any any2;
   any2.set_type_url("type.googleapis.com/google.protobuf.Struct");
-  any2.PackFrom(struct2);
+  std::ignore = any2.PackFrom(struct2);
   (*stream_info.metadata_.mutable_typed_filter_metadata())["envoy.metadata.two"] = any2;
 
   Filters::Common::Lua::LuaDeathRef<StreamInfoWrapper> wrapper(
@@ -987,7 +1017,7 @@ TEST_F(LuaStreamInfoWrapperTest, IterateDynamicTypedMetadata) {
   EXPECT_CALL(printer_, testPrint("found_metadata_two"));
   EXPECT_CALL(printer_, testPrint("value_two"));
   EXPECT_CALL(printer_, testPrint("metadata_three_not_found"));
-  start("callMe");
+  EXPECT_OK(start("callMe"));
   wrapper.reset();
 }
 
@@ -1012,15 +1042,15 @@ TEST_F(LuaStreamInfoWrapperTest, GetFilterStateBasic) {
                                          StreamInfo::FilterState::LifeSpan::FilterChain);
 
   // Create a simple string accessor for testing.
-  stream_info.filterState()->setData(
-      "test_key", std::make_shared<Router::StringAccessorImpl>("test_value"),
-      StreamInfo::FilterState::StateType::ReadOnly, StreamInfo::FilterState::LifeSpan::FilterChain);
+  stream_info.filterState()->setData("test_key",
+                                     std::make_shared<Router::StringAccessorImpl>("test_value"),
+                                     StreamInfo::FilterState::LifeSpan::FilterChain);
 
   Filters::Common::Lua::LuaDeathRef<StreamInfoWrapper> wrapper(
       StreamInfoWrapper::create(coroutine_->luaState(), stream_info), true);
   EXPECT_CALL(printer_, testPrint("found_filter_state"));
   EXPECT_CALL(printer_, testPrint("test_value"));
-  start("callMe");
+  EXPECT_OK(start("callMe"));
   wrapper.reset();
 }
 
@@ -1046,7 +1076,7 @@ TEST_F(LuaStreamInfoWrapperTest, GetFilterStateMissing) {
   Filters::Common::Lua::LuaDeathRef<StreamInfoWrapper> wrapper(
       StreamInfoWrapper::create(coroutine_->luaState(), stream_info), true);
   EXPECT_CALL(printer_, testPrint("filter_state_not_found"));
-  start("callMe");
+  EXPECT_OK(start("callMe"));
   wrapper.reset();
 }
 
@@ -1082,11 +1112,9 @@ TEST_F(LuaStreamInfoWrapperTest, GetMultipleFilterStateObjects) {
 
   // Add multiple filter state objects.
   stream_info.filterState()->setData("key1", std::make_shared<Router::StringAccessorImpl>("value1"),
-                                     StreamInfo::FilterState::StateType::ReadOnly,
                                      StreamInfo::FilterState::LifeSpan::FilterChain);
 
   stream_info.filterState()->setData("key2", std::make_shared<Router::StringAccessorImpl>("value2"),
-                                     StreamInfo::FilterState::StateType::ReadOnly,
                                      StreamInfo::FilterState::LifeSpan::FilterChain);
 
   Filters::Common::Lua::LuaDeathRef<StreamInfoWrapper> wrapper(
@@ -1096,7 +1124,7 @@ TEST_F(LuaStreamInfoWrapperTest, GetMultipleFilterStateObjects) {
   EXPECT_CALL(printer_, testPrint("found_key2"));
   EXPECT_CALL(printer_, testPrint("value2"));
   EXPECT_CALL(printer_, testPrint("key3_not_found"));
-  start("callMe");
+  EXPECT_OK(start("callMe"));
   wrapper.reset();
 }
 
@@ -1125,16 +1153,16 @@ TEST_F(LuaStreamInfoWrapperTest, GetFilterStateNumericAccessor) {
                                          StreamInfo::FilterState::LifeSpan::FilterChain);
 
   // Add numeric filter state object.
-  stream_info.filterState()->setData(
-      "numeric_key", std::make_shared<StreamInfo::UInt64AccessorImpl>(12345),
-      StreamInfo::FilterState::StateType::ReadOnly, StreamInfo::FilterState::LifeSpan::FilterChain);
+  stream_info.filterState()->setData("numeric_key",
+                                     std::make_shared<StreamInfo::UInt64AccessorImpl>(12345),
+                                     StreamInfo::FilterState::LifeSpan::FilterChain);
 
   Filters::Common::Lua::LuaDeathRef<StreamInfoWrapper> wrapper(
       StreamInfoWrapper::create(coroutine_->luaState(), stream_info), true);
   EXPECT_CALL(printer_, testPrint("found_numeric"));
   EXPECT_CALL(printer_, testPrint("12345"));
   EXPECT_CALL(printer_, testPrint("correct_string_type"));
-  start("callMe");
+  EXPECT_OK(start("callMe"));
   wrapper.reset();
 }
 
@@ -1163,16 +1191,16 @@ TEST_F(LuaStreamInfoWrapperTest, GetFilterStateBooleanAccessor) {
                                          StreamInfo::FilterState::LifeSpan::FilterChain);
 
   // Add boolean filter state object.
-  stream_info.filterState()->setData(
-      "bool_key", std::make_shared<StreamInfo::BoolAccessorImpl>(true),
-      StreamInfo::FilterState::StateType::ReadOnly, StreamInfo::FilterState::LifeSpan::FilterChain);
+  stream_info.filterState()->setData("bool_key",
+                                     std::make_shared<StreamInfo::BoolAccessorImpl>(true),
+                                     StreamInfo::FilterState::LifeSpan::FilterChain);
 
   Filters::Common::Lua::LuaDeathRef<StreamInfoWrapper> wrapper(
       StreamInfoWrapper::create(coroutine_->luaState(), stream_info), true);
   EXPECT_CALL(printer_, testPrint("found_boolean"));
   EXPECT_CALL(printer_, testPrint("true"));
   EXPECT_CALL(printer_, testPrint("correct_string_type"));
-  start("callMe");
+  EXPECT_OK(start("callMe"));
   wrapper.reset();
 }
 
@@ -1181,7 +1209,7 @@ class TestFieldSupportingFilterState : public StreamInfo::FilterState::Object {
 public:
   TestFieldSupportingFilterState(std::string base_value) : base_value_(base_value) {}
 
-  absl::optional<std::string> serializeAsString() const override { return base_value_; }
+  std::optional<std::string> serializeAsString() const override { return base_value_; }
 
   bool hasFieldSupport() const override { return true; }
 
@@ -1226,16 +1254,16 @@ TEST_F(LuaStreamInfoWrapperTest, GetFilterStateFieldAccessString) {
                                          StreamInfo::FilterState::LifeSpan::FilterChain);
 
   // Add field-supporting filter state object.
-  stream_info.filterState()->setData(
-      "field_key", std::make_shared<TestFieldSupportingFilterState>("base_value"),
-      StreamInfo::FilterState::StateType::ReadOnly, StreamInfo::FilterState::LifeSpan::FilterChain);
+  stream_info.filterState()->setData("field_key",
+                                     std::make_shared<TestFieldSupportingFilterState>("base_value"),
+                                     StreamInfo::FilterState::LifeSpan::FilterChain);
 
   Filters::Common::Lua::LuaDeathRef<StreamInfoWrapper> wrapper(
       StreamInfoWrapper::create(coroutine_->luaState(), stream_info), true);
   EXPECT_CALL(printer_, testPrint("found_string_field"));
   EXPECT_CALL(printer_, testPrint("field_string_value"));
   EXPECT_CALL(printer_, testPrint("correct_string_type"));
-  start("callMe");
+  EXPECT_OK(start("callMe"));
   wrapper.reset();
 }
 
@@ -1264,16 +1292,16 @@ TEST_F(LuaStreamInfoWrapperTest, GetFilterStateFieldAccessNumeric) {
                                          StreamInfo::FilterState::LifeSpan::FilterChain);
 
   // Add field-supporting filter state object.
-  stream_info.filterState()->setData(
-      "field_key", std::make_shared<TestFieldSupportingFilterState>("base_value"),
-      StreamInfo::FilterState::StateType::ReadOnly, StreamInfo::FilterState::LifeSpan::FilterChain);
+  stream_info.filterState()->setData("field_key",
+                                     std::make_shared<TestFieldSupportingFilterState>("base_value"),
+                                     StreamInfo::FilterState::LifeSpan::FilterChain);
 
   Filters::Common::Lua::LuaDeathRef<StreamInfoWrapper> wrapper(
       StreamInfoWrapper::create(coroutine_->luaState(), stream_info), true);
   EXPECT_CALL(printer_, testPrint("found_numeric_field"));
   EXPECT_CALL(printer_, testPrint("42"));
   EXPECT_CALL(printer_, testPrint("correct_number_type"));
-  start("callMe");
+  EXPECT_OK(start("callMe"));
   wrapper.reset();
 }
 
@@ -1297,14 +1325,14 @@ TEST_F(LuaStreamInfoWrapperTest, GetFilterStateFieldAccessNonExistent) {
                                          StreamInfo::FilterState::LifeSpan::FilterChain);
 
   // Add field-supporting filter state object.
-  stream_info.filterState()->setData(
-      "field_key", std::make_shared<TestFieldSupportingFilterState>("base_value"),
-      StreamInfo::FilterState::StateType::ReadOnly, StreamInfo::FilterState::LifeSpan::FilterChain);
+  stream_info.filterState()->setData("field_key",
+                                     std::make_shared<TestFieldSupportingFilterState>("base_value"),
+                                     StreamInfo::FilterState::LifeSpan::FilterChain);
 
   Filters::Common::Lua::LuaDeathRef<StreamInfoWrapper> wrapper(
       StreamInfoWrapper::create(coroutine_->luaState(), stream_info), true);
   EXPECT_CALL(printer_, testPrint("nonexistent_field_returned_nil"));
-  start("callMe");
+  EXPECT_OK(start("callMe"));
   wrapper.reset();
 }
 
@@ -1328,14 +1356,14 @@ TEST_F(LuaStreamInfoWrapperTest, GetFilterStateFieldAccessNoSupport) {
                                          StreamInfo::FilterState::LifeSpan::FilterChain);
 
   // Add regular string accessor without field support.
-  stream_info.filterState()->setData(
-      "no_field_key", std::make_shared<Router::StringAccessorImpl>("test_value"),
-      StreamInfo::FilterState::StateType::ReadOnly, StreamInfo::FilterState::LifeSpan::FilterChain);
+  stream_info.filterState()->setData("no_field_key",
+                                     std::make_shared<Router::StringAccessorImpl>("test_value"),
+                                     StreamInfo::FilterState::LifeSpan::FilterChain);
 
   Filters::Common::Lua::LuaDeathRef<StreamInfoWrapper> wrapper(
       StreamInfoWrapper::create(coroutine_->luaState(), stream_info), true);
   EXPECT_CALL(printer_, testPrint("no_field_support_returned_nil"));
-  start("callMe");
+  EXPECT_OK(start("callMe"));
   wrapper.reset();
 }
 
@@ -1366,9 +1394,9 @@ TEST_F(LuaStreamInfoWrapperTest, GetFilterStateFieldAccessFallback) {
                                          StreamInfo::FilterState::LifeSpan::FilterChain);
 
   // Add field-supporting filter state object.
-  stream_info.filterState()->setData(
-      "field_key", std::make_shared<TestFieldSupportingFilterState>("test_base"),
-      StreamInfo::FilterState::StateType::ReadOnly, StreamInfo::FilterState::LifeSpan::FilterChain);
+  stream_info.filterState()->setData("field_key",
+                                     std::make_shared<TestFieldSupportingFilterState>("test_base"),
+                                     StreamInfo::FilterState::LifeSpan::FilterChain);
 
   Filters::Common::Lua::LuaDeathRef<StreamInfoWrapper> wrapper(
       StreamInfoWrapper::create(coroutine_->luaState(), stream_info), true);
@@ -1376,7 +1404,7 @@ TEST_F(LuaStreamInfoWrapperTest, GetFilterStateFieldAccessFallback) {
   EXPECT_CALL(printer_, testPrint("test_base")); // String serialization result
   EXPECT_CALL(printer_, testPrint("found_base_value_field"));
   EXPECT_CALL(printer_, testPrint("test_base")); // Field access result
-  start("callMe");
+  EXPECT_OK(start("callMe"));
   wrapper.reset();
 }
 
@@ -1414,7 +1442,7 @@ TEST_F(LuaStreamInfoWrapperTest, GetFilterStateNullObject) {
       StreamInfoWrapper::create(coroutine_->luaState(), stream_info), true);
   EXPECT_CALL(printer_, testPrint("null_filter_state_returned_nil"));
   EXPECT_CALL(printer_, testPrint("null_filter_state_field_returned_nil"));
-  start("callMe");
+  EXPECT_OK(start("callMe"));
   wrapper.reset();
 }
 
@@ -1467,7 +1495,7 @@ TEST_F(LuaStreamInfoWrapperTest, SetFilterStateBasic) {
       StreamInfoWrapper::create(coroutine_->luaState(), stream_info), true);
   EXPECT_CALL(printer_, testPrint("found"));
   EXPECT_CALL(printer_, testPrint("my_value"));
-  start("callMe");
+  EXPECT_OK(start("callMe"));
 
   // Verify the filter state was actually set on the stream info.
   const auto* accessor =
@@ -1493,9 +1521,10 @@ TEST_F(LuaStreamInfoWrapperTest, SetFilterStateUnknownFactory) {
 
   Filters::Common::Lua::LuaDeathRef<StreamInfoWrapper> wrapper(
       StreamInfoWrapper::create(coroutine_->luaState(), stream_info), true);
-  EXPECT_THROW_WITH_MESSAGE(start("callMe"), Filters::Common::Lua::LuaException,
-                            "[string \"...\"]:3: 'nonexistent.factory' does not have an object "
-                            "factory");
+  EXPECT_THAT(start("callMe"),
+              StatusHelpers::HasStatusMessage(
+                  "[string \"...\"]:3: 'nonexistent.factory' does not have an object "
+                  "factory"));
   wrapper.reset();
 }
 
@@ -1514,9 +1543,10 @@ TEST_F(LuaStreamInfoWrapperTest, SetFilterStateFactoryReturnsNull) {
 
   Filters::Common::Lua::LuaDeathRef<StreamInfoWrapper> wrapper(
       StreamInfoWrapper::create(coroutine_->luaState(), stream_info), true);
-  EXPECT_THROW_WITH_MESSAGE(start("callMe"), Filters::Common::Lua::LuaException,
-                            "[string \"...\"]:3: failed to create an object 'my_key' from value "
-                            "'payload'");
+  EXPECT_THAT(start("callMe"),
+              StatusHelpers::HasStatusMessage(
+                  "[string \"...\"]:3: failed to create an object 'my_key' from value "
+                  "'payload'"));
   wrapper.reset();
 }
 
@@ -1551,7 +1581,7 @@ TEST_F(LuaStreamInfoWrapperTest, SetFilterStateUpstreamSubjectAltNames) {
       StreamInfoWrapper::create(coroutine_->luaState(), stream_info), true);
   EXPECT_CALL(printer_, testPrint("found_sans"));
   EXPECT_CALL(printer_, testPrint("san1.example.com,san2.example.com,san3.example.com"));
-  start("callMe");
+  EXPECT_OK(start("callMe"));
 
   // Verify the filter state was set on the C++ side with the correct SANs.
   const auto* sans = stream_info.filterState()->getDataReadOnly<Network::UpstreamSubjectAltNames>(
@@ -1584,7 +1614,7 @@ TEST_F(LuaStreamInfoWrapperTest, DrainConnectionUponCompletion) {
   // Call drainConnectionUponCompletion to drain the connection.
   Filters::Common::Lua::LuaDeathRef<StreamInfoWrapper> wrapper(
       StreamInfoWrapper::create(coroutine_->luaState(), stream_info), true);
-  start("callMe");
+  EXPECT_OK(start("callMe"));
 
   EXPECT_TRUE(stream_info.shouldDrainConnectionUponCompletion());
 
@@ -1652,7 +1682,7 @@ TEST_F(LuaVirtualHostWrapperTest, GetFilterMetadataBasic) {
   EXPECT_CALL(printer_, testPrint("foo"));
   EXPECT_CALL(printer_, testPrint("bar"));
 
-  start("callMe");
+  EXPECT_OK(start("callMe"));
   wrapper.reset();
 }
 
@@ -1688,7 +1718,7 @@ TEST_F(LuaVirtualHostWrapperTest, GetMetadataNoMetadataUnderFilterName) {
 
   EXPECT_CALL(printer_, testPrint("No metadata found"));
 
-  start("callMe");
+  EXPECT_OK(start("callMe"));
   wrapper.reset();
 }
 
@@ -1714,7 +1744,7 @@ TEST_F(LuaVirtualHostWrapperTest, GetMetadataNoMetadataAtAll) {
 
   EXPECT_CALL(printer_, testPrint("No metadata found"));
 
-  start("callMe");
+  EXPECT_OK(start("callMe"));
   wrapper.reset();
 }
 
@@ -1735,7 +1765,7 @@ TEST_F(LuaVirtualHostWrapperTest, GetMetadataNoVirtualHost) {
 
   EXPECT_CALL(printer_, testPrint("No metadata found"));
 
-  start("callMe");
+  EXPECT_OK(start("callMe"));
   wrapper.reset();
 }
 
@@ -1795,7 +1825,7 @@ TEST_F(LuaRouteWrapperTest, GetFilterMetadataBasic) {
   EXPECT_CALL(printer_, testPrint("foo"));
   EXPECT_CALL(printer_, testPrint("bar"));
 
-  start("callMe");
+  EXPECT_OK(start("callMe"));
   wrapper.reset();
 }
 
@@ -1827,7 +1857,7 @@ TEST_F(LuaRouteWrapperTest, GetMetadataNoMetadataUnderFilterName) {
 
   EXPECT_CALL(printer_, testPrint("No metadata found"));
 
-  start("callMe");
+  EXPECT_OK(start("callMe"));
   wrapper.reset();
 }
 
@@ -1851,7 +1881,7 @@ TEST_F(LuaRouteWrapperTest, GetMetadataNoMetadataAtAll) {
 
   EXPECT_CALL(printer_, testPrint("No metadata found"));
 
-  start("callMe");
+  EXPECT_OK(start("callMe"));
   wrapper.reset();
 }
 
@@ -1871,7 +1901,7 @@ TEST_F(LuaRouteWrapperTest, GetMetadataNoRoute) {
 
   EXPECT_CALL(printer_, testPrint("No metadata found"));
 
-  start("callMe");
+  EXPECT_OK(start("callMe"));
   wrapper.reset();
 }
 
@@ -1911,7 +1941,7 @@ TEST_F(LuaStatsScopeWrapperTest, CounterOperations) {
   EXPECT_CALL(printer_, testPrint("0"));
   EXPECT_CALL(printer_, testPrint("1"));
   EXPECT_CALL(printer_, testPrint("6"));
-  start("callMe");
+  EXPECT_OK(start("callMe"));
 
   // Verify the counter was created with the correct prefix.
   EXPECT_EQ(6, store_.counter("lua.test_counter").value());
@@ -1941,7 +1971,7 @@ TEST_F(LuaStatsScopeWrapperTest, CounterSharedIdentity) {
       true);
   EXPECT_CALL(printer_, testPrint("5"));
   EXPECT_CALL(printer_, testPrint("5"));
-  start("callMe");
+  EXPECT_OK(start("callMe"));
 
   EXPECT_EQ(5, store_.counter("lua.shared").value());
   wrapper.reset();
@@ -1962,8 +1992,8 @@ TEST_F(LuaStatsScopeWrapperTest, CounterNegativeAddFails) {
   Filters::Common::Lua::LuaDeathRef<StatsScopeWrapper> wrapper(
       StatsScopeWrapper::create(coroutine_->luaState(), *store_.rootScope()->createScope("lua")),
       true);
-  EXPECT_THROW_WITH_MESSAGE(start("callMe"), Filters::Common::Lua::LuaException,
-                            "[string \"...\"]:4: counter add amount must be non-negative");
+  EXPECT_THAT(start("callMe"), StatusHelpers::HasStatusMessage(
+                                   "[string \"...\"]:4: counter add amount must be non-negative"));
   wrapper.reset();
 }
 
@@ -1998,7 +2028,7 @@ TEST_F(LuaStatsScopeWrapperTest, GaugeOperations) {
   EXPECT_CALL(printer_, testPrint("100"));
   EXPECT_CALL(printer_, testPrint("110"));
   EXPECT_CALL(printer_, testPrint("105"));
-  start("callMe");
+  EXPECT_OK(start("callMe"));
 
   // Verify the gauge was created with the correct prefix.
   EXPECT_EQ(105, store_.gauge("lua.test_gauge", Stats::Gauge::ImportMode::NeverImport).value());
@@ -2027,7 +2057,7 @@ TEST_F(LuaStatsScopeWrapperTest, GaugeSharedIdentity) {
       true);
   EXPECT_CALL(printer_, testPrint("15"));
   EXPECT_CALL(printer_, testPrint("15"));
-  start("callMe");
+  EXPECT_OK(start("callMe"));
 
   EXPECT_EQ(15, store_.gauge("lua.shared", Stats::Gauge::ImportMode::NeverImport).value());
   wrapper.reset();
@@ -2061,8 +2091,8 @@ TEST_F(LuaStatsScopeWrapperTest, GaugeNegativeValueFails) {
   Filters::Common::Lua::LuaDeathRef<StatsScopeWrapper> wrapper1(
       StatsScopeWrapper::create(coroutine_->luaState(), *store_.rootScope()->createScope("lua")),
       true);
-  EXPECT_THROW_WITH_MESSAGE(start("callMe"), Filters::Common::Lua::LuaException,
-                            "[string \"...\"]:4: gauge set value must be non-negative");
+  EXPECT_THAT(start("callMe"), StatusHelpers::HasStatusMessage(
+                                   "[string \"...\"]:4: gauge set value must be non-negative"));
   wrapper1.reset();
 
   // Test add with negative value.
@@ -2070,8 +2100,8 @@ TEST_F(LuaStatsScopeWrapperTest, GaugeNegativeValueFails) {
   Filters::Common::Lua::LuaDeathRef<StatsScopeWrapper> wrapper2(
       StatsScopeWrapper::create(coroutine_->luaState(), *store_.rootScope()->createScope("lua")),
       true);
-  EXPECT_THROW_WITH_MESSAGE(start("callMe"), Filters::Common::Lua::LuaException,
-                            "[string \"...\"]:4: gauge add amount must be non-negative");
+  EXPECT_THAT(start("callMe"), StatusHelpers::HasStatusMessage(
+                                   "[string \"...\"]:4: gauge add amount must be non-negative"));
   wrapper2.reset();
 
   // Test sub with negative value.
@@ -2079,8 +2109,8 @@ TEST_F(LuaStatsScopeWrapperTest, GaugeNegativeValueFails) {
   Filters::Common::Lua::LuaDeathRef<StatsScopeWrapper> wrapper3(
       StatsScopeWrapper::create(coroutine_->luaState(), *store_.rootScope()->createScope("lua")),
       true);
-  EXPECT_THROW_WITH_MESSAGE(start("callMe"), Filters::Common::Lua::LuaException,
-                            "[string \"...\"]:4: gauge sub amount must be non-negative");
+  EXPECT_THAT(start("callMe"), StatusHelpers::HasStatusMessage(
+                                   "[string \"...\"]:4: gauge sub amount must be non-negative"));
   wrapper3.reset();
 }
 
@@ -2101,12 +2131,12 @@ TEST_F(LuaStatsScopeWrapperTest, HistogramOperations) {
   Filters::Common::Lua::LuaDeathRef<StatsScopeWrapper> wrapper(
       StatsScopeWrapper::create(coroutine_->luaState(), *store_.rootScope()->createScope("lua")),
       true);
-  start("callMe");
+  EXPECT_OK(start("callMe"));
 
   // Verify the histogram was created with the correct prefix and unit.
   auto histogram = store_.findHistogramByString("lua.test_histogram");
   ASSERT_TRUE(histogram.has_value());
-  EXPECT_EQ(Stats::Histogram::Unit::Unspecified, histogram->get().unit());
+  EXPECT_EQ(Stats::Histogram::Unit::Unspecified, histogram->unit());
   wrapper.reset();
 }
 
@@ -2128,12 +2158,12 @@ TEST_F(LuaStatsScopeWrapperTest, HistogramSharedIdentity) {
   Filters::Common::Lua::LuaDeathRef<StatsScopeWrapper> wrapper(
       StatsScopeWrapper::create(coroutine_->luaState(), *store_.rootScope()->createScope("lua")),
       true);
-  start("callMe");
+  EXPECT_OK(start("callMe"));
 
   // Verify only one histogram was created, not two.
   ASSERT_TRUE(store_.findHistogramByString("lua.shared").has_value());
   EXPECT_EQ(Stats::Histogram::Unit::Milliseconds,
-            store_.findHistogramByString("lua.shared")->get().unit());
+            store_.findHistogramByString("lua.shared")->unit());
   wrapper.reset();
 }
 
@@ -2150,6 +2180,9 @@ TEST_F(LuaStatsScopeWrapperTest, HistogramUnits) {
       local us_histogram = object:histogram("latency_us", "microseconds")
       us_histogram:recordValue(500)
 
+      local ns_histogram = object:histogram("latency_ns", "nanoseconds")
+      ns_histogram:recordValue(40700)
+
       local unspecified_histogram = object:histogram("count", "unspecified")
       unspecified_histogram:recordValue(42)
     end
@@ -2161,24 +2194,28 @@ TEST_F(LuaStatsScopeWrapperTest, HistogramUnits) {
   Filters::Common::Lua::LuaDeathRef<StatsScopeWrapper> wrapper(
       StatsScopeWrapper::create(coroutine_->luaState(), *store_.rootScope()->createScope("lua")),
       true);
-  start("callMe");
+  EXPECT_OK(start("callMe"));
 
   // Verify histograms were created with correct units.
   auto latency = store_.findHistogramByString("lua.latency");
   ASSERT_TRUE(latency.has_value());
-  EXPECT_EQ(Stats::Histogram::Unit::Milliseconds, latency->get().unit());
+  EXPECT_EQ(Stats::Histogram::Unit::Milliseconds, latency->unit());
 
   auto size = store_.findHistogramByString("lua.size");
   ASSERT_TRUE(size.has_value());
-  EXPECT_EQ(Stats::Histogram::Unit::Bytes, size->get().unit());
+  EXPECT_EQ(Stats::Histogram::Unit::Bytes, size->unit());
 
   auto latency_us = store_.findHistogramByString("lua.latency_us");
   ASSERT_TRUE(latency_us.has_value());
-  EXPECT_EQ(Stats::Histogram::Unit::Microseconds, latency_us->get().unit());
+  EXPECT_EQ(Stats::Histogram::Unit::Microseconds, latency_us->unit());
+
+  auto latency_ns = store_.findHistogramByString("lua.latency_ns");
+  ASSERT_TRUE(latency_ns.has_value());
+  EXPECT_EQ(Stats::Histogram::Unit::Nanoseconds, latency_ns->unit());
 
   auto count = store_.findHistogramByString("lua.count");
   ASSERT_TRUE(count.has_value());
-  EXPECT_EQ(Stats::Histogram::Unit::Unspecified, count->get().unit());
+  EXPECT_EQ(Stats::Histogram::Unit::Unspecified, count->unit());
 
   wrapper.reset();
 }
@@ -2197,10 +2234,11 @@ TEST_F(LuaStatsScopeWrapperTest, HistogramInvalidUnit) {
   Filters::Common::Lua::LuaDeathRef<StatsScopeWrapper> wrapper(
       StatsScopeWrapper::create(coroutine_->luaState(), *store_.rootScope()->createScope("lua")),
       true);
-  EXPECT_THROW_WITH_MESSAGE(
-      start("callMe"), Filters::Common::Lua::LuaException,
-      "[string \"...\"]:3: invalid histogram unit 'invalid_unit', expected 'ms', 'milliseconds', "
-      "'microseconds', 'bytes', or 'unspecified'");
+  EXPECT_THAT(start("callMe"),
+              StatusHelpers::HasStatusMessage("[string \"...\"]:3: invalid histogram unit "
+                                              "'invalid_unit', expected 'ms', 'milliseconds', "
+                                              "'microseconds', 'nanoseconds', 'bytes', or "
+                                              "'unspecified'"));
   wrapper.reset();
 }
 
@@ -2219,8 +2257,8 @@ TEST_F(LuaStatsScopeWrapperTest, HistogramNegativeValueFails) {
   Filters::Common::Lua::LuaDeathRef<StatsScopeWrapper> wrapper(
       StatsScopeWrapper::create(coroutine_->luaState(), *store_.rootScope()->createScope("lua")),
       true);
-  EXPECT_THROW_WITH_MESSAGE(start("callMe"), Filters::Common::Lua::LuaException,
-                            "[string \"...\"]:4: histogram value must be non-negative");
+  EXPECT_THAT(start("callMe"), StatusHelpers::HasStatusMessage(
+                                   "[string \"...\"]:4: histogram value must be non-negative"));
   wrapper.reset();
 }
 
@@ -2240,10 +2278,95 @@ TEST_F(LuaStatsScopeWrapperTest, StatsPrefix) {
       StatsScopeWrapper::create(coroutine_->luaState(),
                                 *store_.rootScope()->createScope("http.lua.custom")),
       true);
-  start("callMe");
+  EXPECT_OK(start("callMe"));
 
   // Verify the counter was created with the full prefix.
   EXPECT_EQ(1, store_.counter("http.lua.custom.my.counter").value());
+  wrapper.reset();
+}
+
+// Test that RouteWrapper returns metadata under the namespace that is specified by the script
+// rather than the filter config name.
+TEST_F(LuaRouteWrapperTest, GetMetadataWithNamespace) {
+  const std::string SCRIPT{R"EOF(
+    function callMe(object)
+      testPrint(object:metadata("custom.namespace"):get("foo.bar")["name"])
+      testPrint(object:metadata("another.namespace"):get("foo.bar")["name"])
+      -- The default namespace is still the filter config name.
+      testPrint(object:metadata():get("foo.bar")["name"])
+      testPrint(object:metadata(nil):get("foo.bar")["name"])
+      testPrint(object:metadata(""):get("foo.bar")["name"])
+      -- The wrappers of different namespaces could be used at the same time.
+      local custom = object:metadata("custom.namespace")
+      local default = object:metadata()
+      testPrint(custom:get("foo.bar")["prop"])
+      testPrint(default:get("foo.bar")["prop"])
+      -- The namespace that does not exist results in empty metadata.
+      for _, _ in pairs(object:metadata("unknown.namespace")) do
+        return
+      end
+      testPrint("No metadata found")
+    end
+  )EOF"};
+
+  const std::string METADATA{R"EOF(
+    filter_metadata:
+      lua-filter-config-name:
+        foo.bar:
+          name: foo
+          prop: bar
+      custom.namespace:
+        foo.bar:
+          name: custom-foo
+          prop: custom-bar
+      another.namespace:
+        foo.bar:
+          name: another-foo
+  )EOF"};
+
+  InSequence s;
+  setup(SCRIPT);
+
+  auto route = std::make_shared<NiceMock<Router::MockRoute>>();
+  TestUtility::loadFromYaml(METADATA, route->metadata_);
+
+  NiceMock<Envoy::StreamInfo::MockStreamInfo> stream_info;
+  stream_info.route_ = route;
+
+  Filters::Common::Lua::LuaDeathRef<RouteWrapper> wrapper(
+      RouteWrapper::create(coroutine_->luaState(), stream_info, "lua-filter-config-name"), true);
+
+  EXPECT_CALL(printer_, testPrint("custom-foo"));
+  EXPECT_CALL(printer_, testPrint("another-foo"));
+  EXPECT_CALL(printer_, testPrint("foo")).Times(3);
+  EXPECT_CALL(printer_, testPrint("custom-bar"));
+  EXPECT_CALL(printer_, testPrint("bar"));
+  EXPECT_CALL(printer_, testPrint("No metadata found"));
+
+  EXPECT_OK(start("callMe"));
+  wrapper.reset();
+}
+
+// Test that RouteWrapper rejects the namespace that is not a string.
+TEST_F(LuaRouteWrapperTest, GetMetadataWithBadNamespace) {
+  const std::string SCRIPT{R"EOF(
+    function callMe(object)
+      object:metadata({})
+    end
+  )EOF"};
+
+  InSequence s;
+  setup(SCRIPT);
+
+  NiceMock<Envoy::StreamInfo::MockStreamInfo> stream_info;
+
+  Filters::Common::Lua::LuaDeathRef<RouteWrapper> wrapper(
+      RouteWrapper::create(coroutine_->luaState(), stream_info, "lua-filter-config-name"), true);
+
+  EXPECT_THAT(
+      start("callMe"),
+      StatusHelpers::HasStatusMessage(
+          "[string \"...\"]:3: bad argument #1 to 'metadata' (string expected, got table)"));
   wrapper.reset();
 }
 

@@ -26,7 +26,6 @@ envoy_cc_test(
     srcs = ["config_test.cc"],
     deps = [
         "//contrib/stat_sinks/wasm_filter/source:config_lib",
-        "//test/mocks/server:server_mocks",
         "//test/test_common:utility_lib",
         "@envoy_api//contrib/envoy/extensions/stat_sinks/wasm_filter/v3:pkg_cc_proto",
     ],
@@ -38,7 +37,7 @@ envoy_cc_test(
     data = envoy_select_wasm_cpp_tests([
         "//contrib/stat_sinks/wasm_filter/test/test_data:stats_filter_plugin.wasm",
     ]),
-    rbe_pool = "6gig",
+    rbe_pool = "linux_x64_small",
     tags = ["skip_on_windows"],
     deps = [
         "//contrib/stat_sinks/wasm_filter/source:wasm_filter_stat_sink_lib",

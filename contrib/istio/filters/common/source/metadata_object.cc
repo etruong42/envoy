@@ -1,5 +1,7 @@
 #include "contrib/istio/filters/common/source/metadata_object.h"
 
+#include <optional>
+
 #include "envoy/config/core/v3/base.pb.h"
 #include "envoy/registry/registry.h"
 
@@ -9,7 +11,7 @@
 
 #include "absl/strings/str_join.h"
 
-namespace Envoy {
+// NOLINT(namespace-envoy)
 namespace Istio {
 namespace Common {
 
@@ -56,7 +58,7 @@ static absl::flat_hash_map<absl::string_view, WorkloadType> ALL_WORKLOAD_TOKENS 
     {CronJobSuffix, WorkloadType::CronJob},
 };
 
-absl::optional<absl::string_view> toSuffix(WorkloadType workload_type) {
+std::optional<absl::string_view> toSuffix(WorkloadType workload_type) {
   switch (workload_type) {
   case WorkloadType::Deployment:
     return DeploymentSuffix;
@@ -81,33 +83,35 @@ std::string WorkloadMetadataObject::baggage() const {
     parts.push_back("k8s." + std::string(workload_type) + ".name=" + std::string(workload_name_));
   }
 
-  const auto appName = field(AppNameToken).value_or("");
-  const auto serviceName = field(ServiceNameToken).value_or(appName);
+  const auto appName = field(Istio::Common::AppNameToken).value_or("");
+  const auto serviceName = field(Istio::Common::ServiceNameToken).value_or(appName);
 
   if (!serviceName.empty()) {
-    parts.push_back(absl::StrCat(ServiceNameBaggageToken, "=", serviceName));
+    parts.push_back(absl::StrCat(Istio::Common::ServiceNameBaggageToken, "=", serviceName));
   }
 
   if (!appName.empty() && appName != serviceName) {
-    parts.push_back(absl::StrCat(AppNameBaggageToken, "=", appName));
+    parts.push_back(absl::StrCat(Istio::Common::AppNameBaggageToken, "=", appName));
   }
 
-  const auto appVersion = field(AppVersionToken).value_or("");
-  const auto serviceVersion = field(ServiceVersionToken).value_or(appVersion);
+  const auto appVersion = field(Istio::Common::AppVersionToken).value_or("");
+  const auto serviceVersion = field(Istio::Common::ServiceVersionToken).value_or(appVersion);
 
   if (!serviceVersion.empty()) {
-    parts.push_back(absl::StrCat(ServiceVersionBaggageToken, "=", serviceVersion));
+    parts.push_back(absl::StrCat(Istio::Common::ServiceVersionBaggageToken, "=", serviceVersion));
   }
 
   if (!appVersion.empty() && appVersion != serviceVersion) {
-    parts.push_back(absl::StrCat(AppVersionBaggageToken, "=", appVersion));
+    parts.push_back(absl::StrCat(Istio::Common::AppVersionBaggageToken, "=", appVersion));
   }
 
   // Map the workload metadata fields to baggage tokens
   const std::vector<std::pair<absl::string_view, absl::string_view>> field_to_baggage = {
-      {NamespaceNameToken, NamespaceNameBaggageToken}, {ClusterNameToken, ClusterNameBaggageToken},
-      {InstanceNameToken, InstanceNameBaggageToken},   {RegionToken, LocalityRegionBaggageToken},
-      {ZoneToken, LocalityZoneBaggageToken},
+      {Istio::Common::NamespaceNameToken, Istio::Common::NamespaceNameBaggageToken},
+      {Istio::Common::ClusterNameToken, Istio::Common::ClusterNameBaggageToken},
+      {Istio::Common::InstanceNameToken, Istio::Common::InstanceNameBaggageToken},
+      {Istio::Common::RegionToken, Istio::Common::LocalityRegionBaggageToken},
+      {Istio::Common::ZoneToken, Istio::Common::LocalityZoneBaggageToken},
   };
 
   for (const auto& [field_name, baggage_key] : field_to_baggage) {
@@ -214,16 +218,16 @@ WorkloadMetadataObject::serializeAsPairs() const {
   return parts;
 }
 
-absl::optional<std::string> WorkloadMetadataObject::serializeAsString() const {
+std::optional<std::string> WorkloadMetadataObject::serializeAsString() const {
   const auto parts = serializeAsPairs();
   return absl::StrJoin(parts, ",", absl::PairFormatter("="));
 }
 
-absl::optional<uint64_t> WorkloadMetadataObject::hash() const {
+std::optional<uint64_t> WorkloadMetadataObject::hash() const {
   return Envoy::HashUtil::xxHash64(*serializeAsString());
 }
 
-absl::optional<std::string> WorkloadMetadataObject::owner() const {
+std::optional<std::string> WorkloadMetadataObject::owner() const {
   const auto suffix = toSuffix(workload_type_);
   if (suffix) {
     return absl::StrCat(OwnerPrefix, namespace_name_, "/", *suffix, "s/", workload_name_);
@@ -301,21 +305,21 @@ Envoy::Protobuf::Struct convertWorkloadMetadataToStruct(const WorkloadMetadataOb
 }
 
 // Convert struct to a metadata object.
-std::unique_ptr<WorkloadMetadataObject>
+WorkloadMetadataObjectConstSharedPtr
 convertStructToWorkloadMetadata(const Envoy::Protobuf::Struct& metadata) {
   return convertStructToWorkloadMetadata(metadata, {});
 }
 
-std::unique_ptr<WorkloadMetadataObject>
+WorkloadMetadataObjectConstSharedPtr
 convertStructToWorkloadMetadata(const Envoy::Protobuf::Struct& metadata,
                                 const absl::flat_hash_set<std::string>& additional_labels) {
   return convertStructToWorkloadMetadata(metadata, additional_labels, {});
 }
 
-std::unique_ptr<WorkloadMetadataObject>
+WorkloadMetadataObjectConstSharedPtr
 convertStructToWorkloadMetadata(const Envoy::Protobuf::Struct& metadata,
                                 const absl::flat_hash_set<std::string>& additional_labels,
-                                const absl::optional<envoy::config::core::v3::Locality> locality) {
+                                const std::optional<envoy::config::core::v3::Locality> locality) {
   absl::string_view instance, namespace_name, owner, workload, cluster, identity, canonical_name,
       canonical_revision, app_name, app_version, region, zone;
   std::vector<std::pair<std::string, std::string>> labels;
@@ -372,22 +376,22 @@ convertStructToWorkloadMetadata(const Envoy::Protobuf::Struct& metadata,
       locality_zone = locality->zone();
     }
   }
-  auto obj = std::make_unique<WorkloadMetadataObject>(
+  auto obj = std::make_shared<WorkloadMetadataObject>(
       instance, cluster, namespace_name, workload, canonical_name, canonical_revision, app_name,
       app_version, parseOwner(owner, workload), identity, locality_region, locality_zone);
   obj->setLabels(labels);
   return obj;
 }
 
-absl::optional<WorkloadMetadataObject>
+std::optional<WorkloadMetadataObject>
 convertEndpointMetadata(const std::string& endpoint_encoding) {
   std::vector<absl::string_view> parts = absl::StrSplit(endpoint_encoding, ';');
   if (parts.size() < 5) {
     return {};
   }
-  return absl::make_optional<WorkloadMetadataObject>("", parts[4], parts[1], parts[0], parts[2],
-                                                     parts[3], "", "", WorkloadType::Unknown, "",
-                                                     "", "");
+  return std::make_optional<WorkloadMetadataObject>("", parts[4], parts[1], parts[0], parts[2],
+                                                    parts[3], "", "", WorkloadType::Unknown, "", "",
+                                                    "");
 }
 
 std::string serializeToStringDeterministic(const Envoy::Protobuf::Struct& metadata) {
@@ -403,8 +407,7 @@ std::string serializeToStringDeterministic(const Envoy::Protobuf::Struct& metada
   return out;
 }
 
-absl::optional<absl::string_view>
-WorkloadMetadataObject::field(absl::string_view field_name) const {
+std::optional<absl::string_view> WorkloadMetadataObject::field(absl::string_view field_name) const {
   const auto it = ALL_METADATA_FIELDS.find(field_name);
   if (it != ALL_METADATA_FIELDS.end()) {
     switch (it->second) {
@@ -435,7 +438,7 @@ WorkloadMetadataObject::field(absl::string_view field_name) const {
       return locality_zone_;
     }
   }
-  return absl::nullopt;
+  return std::nullopt;
 }
 
 WorkloadMetadataObject::FieldType
@@ -447,13 +450,12 @@ WorkloadMetadataObject::getField(absl::string_view field_name) const {
   return {};
 }
 
-std::unique_ptr<WorkloadMetadataObject>
-convertBaggageToWorkloadMetadata(absl::string_view baggage) {
+WorkloadMetadataObjectConstSharedPtr convertBaggageToWorkloadMetadata(absl::string_view baggage) {
   return convertBaggageToWorkloadMetadata(baggage, "");
 }
 
-std::unique_ptr<WorkloadMetadataObject>
-convertBaggageToWorkloadMetadata(absl::string_view data, absl::string_view identity) {
+WorkloadMetadataObjectConstSharedPtr convertBaggageToWorkloadMetadata(absl::string_view data,
+                                                                      absl::string_view identity) {
   absl::string_view instance;
   absl::string_view cluster;
   absl::string_view workload;
@@ -505,7 +507,7 @@ convertBaggageToWorkloadMetadata(absl::string_view data, absl::string_view ident
         break;
       case BaggageToken::WorkloadName: {
         workload = parts.second;
-        std::vector<absl::string_view> splitWorkloadKey = absl::StrSplit(parts.first, ".");
+        std::vector<absl::string_view> splitWorkloadKey = absl::StrSplit(parts.first, '.');
         if (splitWorkloadKey.size() >= 2 && splitWorkloadKey[0] == "k8s") {
           workload_type = fromSuffix(splitWorkloadKey[1]);
         }
@@ -525,11 +527,10 @@ convertBaggageToWorkloadMetadata(absl::string_view data, absl::string_view ident
       }
     }
   }
-  return std::make_unique<WorkloadMetadataObject>(
+  return std::make_shared<const WorkloadMetadataObject>(
       instance, cluster, namespace_name, workload, canonical_name, canonical_revision, app_name,
       app_version, workload_type, identity, region, zone);
 }
 
 } // namespace Common
 } // namespace Istio
-} // namespace Envoy

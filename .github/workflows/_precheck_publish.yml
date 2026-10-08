@@ -6,6 +6,7 @@ permissions:
 on:
   workflow_call:
     secrets:
+      dockerhub-token:
       gcp-key:
         required: true
     inputs:
@@ -23,6 +24,8 @@ concurrency:
 
 jobs:
   publish:
+    secrets:
+      dockerhub-token: ${{ secrets.dockerhub-token }}
     permissions:
       actions: read
       contents: read
@@ -31,8 +34,6 @@ jobs:
     name: ${{ matrix.name || matrix.target }}
     with:
       arch: ${{ matrix.arch }}
-      bazel-cache: ${{ matrix.bazel-cache != 'DISABLE' }}
-      bazel-cache-output-base: ${{ matrix.bazel-cache-output-base || 'base' }}
       bazel-extra: ${{ matrix.bazel-extra || '--config=rbe' }}
       cache-build-image: ${{ fromJSON(inputs.request).request.build-image.default }}
       cache-build-image-key-suffix: ${{ matrix.arch == 'arm64' && '-arm64' || '' }}
@@ -45,13 +46,14 @@ jobs:
         ERROR
         error:
         Error:
+        FAILED
+        FAIL:
       skip: ${{ matrix.skip != false && true || false }}
       steps-post: ${{ matrix.steps-post }}
       target: ${{ matrix.target }}
       target-suffix: ${{ matrix.target-suffix }}
       trusted: ${{ inputs.trusted }}
-      upload-name: ${{ matrix.upload-name }}
-      upload-path: ${{ matrix.upload-path }}
+      uploads: ${{ matrix.uploads }}
     strategy:
       fail-fast: false
       matrix:
@@ -70,22 +72,18 @@ jobs:
           timeout-minutes: 180
         - target: config
           name: Config
-          bazel-cache: true
-          bazel-cache-output-base: docs
           rbe: true
           skip: ${{ ! fromJSON(inputs.request).run.precheck-publish-config }}
         - target: docs
           name: Docs
-          bazel-cache: true
-          bazel-cache-output-base: docs
           bazel-extra: >-
             --config=rbe
             --config=docs-ci
           rbe: true
-          upload-name: docs
-          upload-path: generated/docs
+          uploads: |
+            docs: generated/docs
           steps-post: |
-            - uses: envoyproxy/toolshed/actions/jq@3c6fada5be38699cba49c9883d731ebe503d0b9d  # v0.4.10
+            - uses: envoyproxy/toolshed/actions/jq@16ee2e312bbd80a2db5d76d22233722d0cfd82fa  # actions-v0.4.28
               with:
                 output-path: generated/docs/gcs-metadata.json
                 input-format: yaml
@@ -114,3 +112,5 @@ jobs:
     with:
       artifacts: |
         ["docs"]
+      request: ${{ inputs.request }}
+      trusted: ${{ inputs.trusted }}

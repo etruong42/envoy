@@ -2,6 +2,7 @@
 
 #include <iterator>
 #include <memory>
+#include <optional>
 #include <type_traits>
 #include <utility>
 
@@ -12,12 +13,12 @@
 #include "source/common/common/scope_tracker.h"
 #include "source/common/http/session_idle_list_interface.h"
 #include "source/common/quic/envoy_quic_connection_debug_visitor_factory_interface.h"
-#include "source/common/quic/envoy_quic_proof_source.h"
 #include "source/common/quic/envoy_quic_server_connection.h"
 #include "source/common/quic/envoy_quic_server_stream.h"
 #include "source/common/quic/quic_filter_manager_connection_impl.h"
+#include "source/common/quic/quic_server_transport_socket_factory.h"
+#include "source/common/runtime/runtime_features.h"
 
-#include "absl/types/optional.h"
 #include "quiche/quic/core/quic_config.h"
 #include "quiche/quic/core/quic_error_codes.h"
 #include "quiche/quic/core/quic_stream.h"
@@ -39,7 +40,7 @@ private:
 
   const ScopeTrackedObject* object_;
   Event::ScopeTracker& tracker_;
-  absl::optional<ScopeTrackerScopeState> state_;
+  std::optional<ScopeTrackerScopeState> state_;
 };
 } // namespace
 
@@ -82,6 +83,21 @@ EnvoyQuicServerSession::~EnvoyQuicServerSession() {
   QuicFilterManagerConnectionImpl::network_connection_ = nullptr;
 }
 
+#ifdef ENVOY_ENABLE_HTTP_DATAGRAMS
+quic::WebTransportHttp3VersionSet
+EnvoyQuicServerSession::LocallySupportedWebTransportVersions() const {
+  if (!Runtime::runtimeFeatureEnabled("envoy.reloadable_features.quic_support_web_transport")) {
+    return {};
+  }
+  if (!http3_options_.has_value() || !http3_options_->allow_extended_connect()) {
+    // WebTransport requires extended CONNECT, so only advertise it when extended CONNECT is
+    // enabled.
+    return {};
+  }
+  return quic::kDefaultSupportedWebTransportVersions;
+}
+#endif
+
 absl::string_view EnvoyQuicServerSession::requestedServerName() const {
   return {GetCryptoStream()->crypto_negotiated_params().sni};
 }
@@ -114,14 +130,19 @@ quic::QuicSpdyStream* EnvoyQuicServerSession::CreateIncomingStream(quic::QuicStr
   if (aboveHighWatermark()) {
     stream->runHighWatermarkCallbacks();
   }
+#ifdef ENVOY_ENABLE_HTTP_DATAGRAMS
+  // On a WebTransport-capable session an incoming bidirectional stream may turn out to be a
+  // WebTransport data stream (first frame WEBTRANSPORT_STREAM) rather than an HTTP request. Defer
+  // setting up the request decoder until real request headers arrive
+  // (EnvoyQuicServerStream::OnInitialHeadersComplete); data streams never reach there and so never
+  // become HCM streams, which would otherwise dangle during connection teardown. Non-WebTransport
+  // sessions keep the original eager behavior.
+  if (SupportsWebTransport()) {
+    return stream;
+  }
+#endif
   setUpRequestDecoder(*stream);
   return stream;
-}
-
-quic::QuicSpdyStream*
-EnvoyQuicServerSession::CreateIncomingStream(quic::PendingStream* /*pending*/) {
-  IS_ENVOY_BUG("Unexpected disallowed server push call");
-  return nullptr;
 }
 
 quic::QuicSpdyStream* EnvoyQuicServerSession::CreateOutgoingBidirectionalStream() {
@@ -158,7 +179,13 @@ void EnvoyQuicServerSession::OnConnectionClosed(const quic::QuicConnectionCloseF
 }
 
 void EnvoyQuicServerSession::Initialize() {
+  if (Runtime::runtimeFeatureEnabled(
+          "envoy.reloadable_features.quic_enable_reset_ssl_after_handshake")) {
+    enable_reset_ssl_after_handshake();
+    reset_ssl_after_handshake_enabled_ = true;
+  }
   quic::QuicServerSessionBase::Initialize();
+
   initialized_ = true;
   MaybeAddSessionToIdleList();
   quic_connection_->setEnvoyConnection(*this, *this);
@@ -185,6 +212,11 @@ quic::QuicConnection* EnvoyQuicServerSession::quicConnection() {
 
 void EnvoyQuicServerSession::OnTlsHandshakeComplete() {
   quic::QuicServerSessionBase::OnTlsHandshakeComplete();
+  if (reset_ssl_after_handshake_enabled_) {
+    // The SSL object is released once the peer acknowledges handshake completion; cache the
+    // presented peer certificate chain (if any) while it is still available.
+    quic_ssl_info_->cachePeerCertificateChain();
+  }
   streamInfo().downstreamTiming().onDownstreamHandshakeComplete(dispatcher_.timeSource());
   raiseConnectionEvent(Network::ConnectionEvent::Connected);
 }
@@ -236,19 +268,46 @@ void EnvoyQuicServerSession::storeConnectionMapPosition(FilterChainToConnectionM
   position_.emplace(connection_map, filter_chain, position);
 }
 
+void EnvoyQuicServerSession::setClientCertificateValidated(
+    const std::vector<bssl::UniquePtr<X509>>& validated_chain) {
+  quic_ssl_info_->onCertValidated(validated_chain);
+}
+
 quic::QuicSSLConfig EnvoyQuicServerSession::GetSSLConfig() const {
   quic::QuicSSLConfig config = quic::QuicServerSessionBase::GetSSLConfig();
-  config.early_data_enabled = position_.has_value()
-                                  ? dynamic_cast<const QuicServerTransportSocketFactory&>(
-                                        position_->filter_chain_.transportSocketFactory())
-                                        .earlyDataEnabled()
-                                  : true;
+  if (position_.has_value()) {
+    const auto& transport_socket_factory = dynamic_cast<const QuicServerTransportSocketFactory&>(
+        position_->filter_chain_.transportSocketFactory());
+    if (transport_socket_factory.requiresClientCertificate()) {
+      config.client_cert_mode = quic::ClientCertMode::kRequire;
+    } else if (transport_socket_factory.clientCertificateValidationConfigured() &&
+               Runtime::runtimeFeatureEnabled(
+                   "envoy.reloadable_features.quic_mtls_server_enabled")) {
+      // Request but do not require a client certificate when a validation context is configured
+      // without `require_client_certificate`, matching the TCP TLS behavior. The required path is
+      // gated at config time, so this optional path is gated by the runtime guard here.
+      config.client_cert_mode = quic::ClientCertMode::kRequest;
+    } else {
+      config.client_cert_mode = quic::ClientCertMode::kNone;
+    }
+    config.early_data_enabled = transport_socket_factory.earlyDataEnabled();
+    config.disable_ticket_support = !transport_socket_factory.resumptionEnabled();
+  } else {
+    config.early_data_enabled = true;
+    config.client_cert_mode = quic::ClientCertMode::kNone;
+    config.disable_ticket_support = false;
+  }
   return config;
 }
 
 void EnvoyQuicServerSession::ProcessUdpPacket(const quic::QuicSocketAddress& self_address,
                                               const quic::QuicSocketAddress& peer_address,
                                               const quic::QuicReceivedPacket& packet) {
+  // The first packet processed by the server session carries the client's initial ClientHello,
+  // so record its arrival as the downstream handshake start. The setter only keeps the first
+  // value, so subsequent packets don't overwrite it.
+  streamInfo().downstreamTiming().onDownstreamHandshakeStart(dispatcher_.timeSource());
+
   // If L4 filters causes the connection to be closed early during initialization, now
   // is the time to actually close the connection.
   maybeHandleCloseDuringInitialize();
@@ -318,6 +377,7 @@ void EnvoyQuicServerSession::OnStreamClosed(quic::QuicStreamId id) {
   }
 }
 
+// NOLINTNEXTLINE(readability-identifier-naming)
 void EnvoyQuicServerSession::TerminateIdleSession() {
   ENVOY_BUG(!on_connection_closed_called_,
             "TerminateIdleSession called after session on close called.");
@@ -325,8 +385,10 @@ void EnvoyQuicServerSession::TerminateIdleSession() {
                                 quic::ConnectionCloseBehavior::SEND_CONNECTION_CLOSE_PACKET);
 }
 
+// NOLINTNEXTLINE(readability-identifier-naming)
 void EnvoyQuicServerSession::OnLastActiveStreamClosed() { MaybeAddSessionToIdleList(); }
 
+// NOLINTNEXTLINE(readability-identifier-naming)
 void EnvoyQuicServerSession::MaybeAddSessionToIdleList() {
   if (session_idle_list_ == nullptr || is_in_idle_list_) {
     return;
@@ -335,6 +397,7 @@ void EnvoyQuicServerSession::MaybeAddSessionToIdleList() {
   session_idle_list_->AddSession(*this);
 }
 
+// NOLINTNEXTLINE(readability-identifier-naming)
 void EnvoyQuicServerSession::MaybeRemoveSessionFromIdleList() {
   if (session_idle_list_ == nullptr || !is_in_idle_list_) {
     return;

@@ -6,6 +6,7 @@
 
 #include "envoy/event/dispatcher.h"
 #include "envoy/event/timer.h"
+#include "envoy/network/drain_decision.h"
 #include "envoy/network/exception.h"
 #include "envoy/server/configuration.h"
 #include "envoy/thread_local/thread_local.h"
@@ -69,7 +70,7 @@ WorkerImpl::WorkerImpl(ThreadLocal::Instance& tls, ListenerHooks& hooks,
       [this](OverloadActionState state) { closeIdleHttpConnectionsCb(state.phase()); });
 }
 
-void WorkerImpl::addListener(absl::optional<uint64_t> overridden_listener,
+void WorkerImpl::addListener(std::optional<uint64_t> overridden_listener,
                              Network::ListenerConfig& listener, AddListenerCompletion completion,
                              Runtime::Loader& runtime, Random::RandomGenerator& random) {
   dispatcher_->post(
@@ -109,7 +110,8 @@ void WorkerImpl::removeFilterChains(uint64_t listener_tag,
       });
 }
 
-void WorkerImpl::start(OptRef<GuardDog> guard_dog, const std::function<void()>& cb) {
+void WorkerImpl::start(OptRef<GuardDog> guard_dog, const std::function<void()>& cb,
+                       std::optional<uint32_t> cpu_id) {
   ASSERT(!thread_);
 
   // In posix, thread names are limited to 15 characters, so contrive to make
@@ -123,6 +125,7 @@ void WorkerImpl::start(OptRef<GuardDog> guard_dog, const std::function<void()>& 
   // TODO(jmarantz): consider refactoring how this naming works so this naming
   // architecture is centralized, resulting in clearer names.
   Thread::Options options{absl::StrCat("wrk:", dispatcher_->name())};
+  options.cpu_affinity_ = cpu_id;
   thread_ = api_.threadFactory().createThread(
       [this, guard_dog, cb]() -> void { threadRoutine(guard_dog, cb); }, options);
 }
@@ -148,6 +151,20 @@ void WorkerImpl::stopListener(Network::ListenerConfig& listener,
     if (completion != nullptr) {
       completion();
     }
+  });
+}
+
+void WorkerImpl::onFilterChainDrain(uint64_t listener_tag,
+                                    const std::list<const Network::FilterChain*>& filter_chains,
+                                    Network::ConnectionDrainEvent drain_event) {
+  dispatcher_->post([this, listener_tag, &filter_chains, drain_event]() -> void {
+    handler_->onFilterChainDrain(listener_tag, filter_chains, drain_event);
+  });
+}
+
+void WorkerImpl::onListenerDrain(uint64_t listener_tag, Network::ConnectionDrainEvent drain_event) {
+  dispatcher_->post([this, listener_tag, drain_event]() -> void {
+    handler_->onListenerDrain(listener_tag, drain_event);
   });
 }
 

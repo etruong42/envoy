@@ -64,7 +64,7 @@ TEST(HttpGrpcAccessLog, TlsLifetimeCheck) {
                          common_config,
                      Common::GrpcAccessLoggerType type) {
           // This is a part of the actual getOrCreateLogger code path and shouldn't crash.
-          std::make_pair(MessageUtil::hash(common_config), type);
+          std::ignore = std::make_pair(MessageUtil::hash(common_config), type);
           return nullptr;
         });
     // Set tls callback in the HttpGrpcAccessLog constructor,
@@ -188,13 +188,13 @@ response: {{}}
 
 class TestCommandParser : public Formatter::CommandParser {
 public:
-  Formatter::FormatterProviderPtr parse(absl::string_view command, absl::string_view,
-                                        absl::optional<size_t>) const override {
+  absl::StatusOr<Formatter::FormatterProviderPtr>
+  parse(absl::string_view command, absl::string_view, std::optional<size_t>) const override {
     if (command == "TEST_CUSTOM_CMD") {
       class TestProvider : public Formatter::FormatterProvider {
       public:
-        absl::optional<std::string> format(const Formatter::Context&,
-                                           const StreamInfo::StreamInfo&) const override {
+        std::optional<std::string> format(const Formatter::Context&,
+                                          const StreamInfo::StreamInfo&) const override {
           return "custom_resolved_value";
         }
         Protobuf::Value formatValue(const Formatter::Context&,
@@ -202,6 +202,15 @@ public:
           Protobuf::Value val;
           val.set_string_value("custom_resolved_value");
           return val;
+        }
+        bool formatTo(std::string& sink, const Formatter::Context&,
+                      const StreamInfo::StreamInfo&) const override {
+          sink.append("custom_resolved_value");
+          return true;
+        }
+        void formatValueTo(Formatter::ValueSink& sink, const Formatter::Context&,
+                           const StreamInfo::StreamInfo&) const override {
+          sink.addString("custom_resolved_value");
         }
       };
       return std::make_unique<TestProvider>();
@@ -216,7 +225,7 @@ public:
     auto any = std::make_unique<Protobuf::Any>();
     Protobuf::Duration value;
     value.set_seconds(10);
-    any->PackFrom(value);
+    std::ignore = any->PackFrom(value);
     return any;
   }
 };
@@ -241,14 +250,11 @@ TEST_F(HttpGrpcAccessLogTest, Marshalling) {
     (*stream_info.metadata_.mutable_filter_metadata())["foo"] = Protobuf::Struct();
     stream_info.filter_state_->setData("string_accessor",
                                        std::make_unique<Router::StringAccessorImpl>("test_value"),
-                                       StreamInfo::FilterState::StateType::ReadOnly,
                                        StreamInfo::FilterState::LifeSpan::FilterChain);
     stream_info.filter_state_->setData("uint32_accessor",
                                        std::make_unique<StreamInfo::UInt32AccessorImpl>(42),
-                                       StreamInfo::FilterState::StateType::ReadOnly,
                                        StreamInfo::FilterState::LifeSpan::FilterChain);
     stream_info.filter_state_->setData("serialized", std::make_unique<TestSerializedFilterState>(),
-                                       StreamInfo::FilterState::StateType::ReadOnly,
                                        StreamInfo::FilterState::LifeSpan::FilterChain);
     stream_info.onRequestComplete();
 
@@ -811,14 +817,11 @@ response: {}
     (*stream_info.metadata_.mutable_filter_metadata())["foo"] = Protobuf::Struct();
     stream_info.filter_state_->setData("string_accessor",
                                        std::make_unique<Router::StringAccessorImpl>("test_value"),
-                                       StreamInfo::FilterState::StateType::ReadOnly,
                                        StreamInfo::FilterState::LifeSpan::FilterChain);
     stream_info.filter_state_->setData("uint32_accessor",
                                        std::make_unique<StreamInfo::UInt32AccessorImpl>(42),
-                                       StreamInfo::FilterState::StateType::ReadOnly,
                                        StreamInfo::FilterState::LifeSpan::FilterChain);
     stream_info.filter_state_->setData("serialized", std::make_unique<TestSerializedFilterState>(),
-                                       StreamInfo::FilterState::StateType::ReadOnly,
                                        StreamInfo::FilterState::LifeSpan::FilterChain);
 
     expectLog(R"EOF(

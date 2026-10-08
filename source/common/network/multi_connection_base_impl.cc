@@ -198,7 +198,7 @@ ConnectionInfoProviderSharedPtr MultiConnectionBaseImpl::connectionInfoProviderS
   return connections_[0]->connectionInfoProviderSharedPtr();
 }
 
-absl::optional<Connection::UnixDomainSocketPeerCredentials>
+std::optional<Connection::UnixDomainSocketPeerCredentials>
 MultiConnectionBaseImpl::unixSocketPeerCredentials() const {
   return connections_[0]->unixSocketPeerCredentials();
 }
@@ -323,12 +323,12 @@ bool MultiConnectionBaseImpl::startSecureTransport() {
   return ret;
 }
 
-absl::optional<std::chrono::milliseconds> MultiConnectionBaseImpl::lastRoundTripTime() const {
+std::optional<std::chrono::milliseconds> MultiConnectionBaseImpl::lastRoundTripTime() const {
   // Note, this might change before connect finishes.
   return connections_[0]->lastRoundTripTime();
 }
 
-absl::optional<uint64_t> MultiConnectionBaseImpl::congestionWindowInBytes() const {
+std::optional<uint64_t> MultiConnectionBaseImpl::congestionWindowInBytes() const {
   // Note, this value changes constantly even within the same connection.
   return connections_[0]->congestionWindowInBytes();
 }
@@ -348,16 +348,30 @@ void MultiConnectionBaseImpl::removeConnectionCallbacks(ConnectionCallbacks& cb)
     connections_[0]->removeConnectionCallbacks(cb);
     return;
   }
-  // Callbacks should only be notified of events on the final connection, so remove
-  // the callback from the list of deferred callbacks.
-  auto i = post_connect_state_.connection_callbacks_.begin();
-  while (i != post_connect_state_.connection_callbacks_.end()) {
-    if (*i == &cb) {
-      post_connect_state_.connection_callbacks_.erase(i);
+  // For performance/safety reasons we just clear the entry and do not resize the vector,
+  // matching ConnectionImplBase::removeConnectionCallbacks. Callers that iterate
+  // connection_callbacks_ skip null entries.
+  for (auto& entry : post_connect_state_.connection_callbacks_) {
+    if (entry == &cb) {
+      entry = nullptr;
       return;
     }
   }
   IS_ENVOY_BUG("Failed to remove connection callbacks");
+}
+
+void MultiConnectionBaseImpl::onDrain(ConnectionDrainEvent drain_event) {
+  if (connect_finished_) {
+    connections_[0]->onDrain(drain_event);
+    return;
+  }
+  // No underlying connection has been chosen yet, so there is nothing to drain and no connection
+  // to notify on behalf of. Retain the event and hand it to the chosen connection once the connect
+  // finishes.
+  if (drain_event_.has_value()) {
+    return;
+  }
+  drain_event_ = drain_event;
 }
 
 void MultiConnectionBaseImpl::close(ConnectionCloseType type, absl::string_view details) {
@@ -607,6 +621,12 @@ void MultiConnectionBaseImpl::setUpFinalConnection(ConnectionEvent event,
     if (cb) {
       connections_[0]->addConnectionCallbacks(*cb);
     }
+  }
+
+  // Hand the retained drain event to the chosen connection last, once every deferred callback has
+  // been added to it and the rest of the post-connect state has been applied.
+  if (drain_event_.has_value()) {
+    connections_[0]->onDrain(*drain_event_);
   }
 }
 

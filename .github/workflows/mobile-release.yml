@@ -29,6 +29,8 @@ jobs:
     uses: ./.github/workflows/_load_env.yml
 
   android-release:
+    secrets:
+      dockerhub-token: ${{ secrets.DOCKERHUB_TOKEN }}
     permissions:
       actions: read
       contents: read
@@ -71,8 +73,8 @@ jobs:
             .
           shell: bash
       target: ${{ matrix.target }}
-      upload-name: ${{ matrix.output }}_android_aar_sources
-      upload-path: /tmp/output/${{ matrix.output }}_android_aar_sources.tar.gz
+      uploads: |
+        ${{ matrix.output }}_android_aar_sources: /tmp/output/${{ matrix.output }}_android_aar_sources.tar.gz
     strategy:
       fail-fast: false
       matrix:
@@ -107,7 +109,7 @@ jobs:
         include:
         - output: envoy
     steps:
-    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+    - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
       with:
         fetch-depth: 0
     - name: Add safe directory
@@ -161,6 +163,8 @@ jobs:
             ${{ matrix.output }}-javadoc.jar.asc
 
   python-release:
+    secrets:
+      dockerhub-token: ${{ secrets.DOCKERHUB_TOKEN }}
     permissions:
       actions: read
       contents: read
@@ -197,8 +201,8 @@ jobs:
             auditwheel repair "$WHEEL_PATH" --wheel-dir /tmp/dist
           shell: bash
       target: ${{ matrix.target }}
-      upload-name: python-wheel
-      upload-path: /tmp/dist/*.whl
+      uploads: |
+        python-wheel: /tmp/dist/*.whl
     strategy:
       fail-fast: false
       matrix:

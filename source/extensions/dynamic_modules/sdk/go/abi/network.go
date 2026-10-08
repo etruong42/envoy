@@ -12,6 +12,7 @@ import (
 	"unsafe"
 
 	sdk "github.com/envoyproxy/envoy/source/extensions/dynamic_modules/sdk/go"
+	"github.com/envoyproxy/envoy/source/extensions/dynamic_modules/sdk/go/internal/recovery"
 	"github.com/envoyproxy/envoy/source/extensions/dynamic_modules/sdk/go/shared"
 )
 
@@ -895,6 +896,8 @@ func (h *dymNetworkFilterHandle) GetWorkerIndex() uint32 {
 }
 
 type dymNetworkConfigHandle struct {
+	dymCommonHandle
+
 	hostConfigPtr C.envoy_dynamic_module_type_network_filter_config_envoy_ptr
 	scheduler     *dymScheduler
 }
@@ -936,6 +939,66 @@ func (h *dymNetworkConfigHandle) DefineCounter(name string) (shared.MetricID, sh
 	return shared.MetricID(metricID), shared.MetricsResult(result)
 }
 
+func (h *dymNetworkConfigHandle) IncrementCounterValue(
+	id shared.MetricID,
+	value uint64,
+) shared.MetricsResult {
+	result := C.envoy_dynamic_module_callback_network_filter_config_increment_counter(
+		h.hostConfigPtr,
+		C.size_t(id),
+		C.uint64_t(value),
+	)
+	return shared.MetricsResult(result)
+}
+
+func (h *dymNetworkConfigHandle) SetGaugeValue(
+	id shared.MetricID,
+	value uint64,
+) shared.MetricsResult {
+	result := C.envoy_dynamic_module_callback_network_filter_config_set_gauge(
+		h.hostConfigPtr,
+		C.size_t(id),
+		C.uint64_t(value),
+	)
+	return shared.MetricsResult(result)
+}
+
+func (h *dymNetworkConfigHandle) IncrementGaugeValue(
+	id shared.MetricID,
+	value uint64,
+) shared.MetricsResult {
+	result := C.envoy_dynamic_module_callback_network_filter_config_increment_gauge(
+		h.hostConfigPtr,
+		C.size_t(id),
+		C.uint64_t(value),
+	)
+	return shared.MetricsResult(result)
+}
+
+func (h *dymNetworkConfigHandle) DecrementGaugeValue(
+	id shared.MetricID,
+	value uint64,
+) shared.MetricsResult {
+	result := C.envoy_dynamic_module_callback_network_filter_config_decrement_gauge(
+		h.hostConfigPtr,
+		C.size_t(id),
+		C.uint64_t(value),
+	)
+	return shared.MetricsResult(result)
+}
+
+func (h *dymNetworkConfigHandle) RecordHistogramValue(
+	id shared.MetricID,
+	value uint64,
+) shared.MetricsResult {
+	result := C.envoy_dynamic_module_callback_network_filter_config_record_histogram_value(
+		h.hostConfigPtr,
+		C.size_t(id),
+		C.uint64_t(value),
+	)
+	return shared.MetricsResult(result)
+}
+
 func (h *dymNetworkConfigHandle) GetScheduler() shared.Scheduler {
 	if h.scheduler == nil {
 		schedulerPtr := C.envoy_dynamic_module_callback_network_filter_config_scheduler_new(
@@ -969,7 +1032,8 @@ func envoy_dynamic_module_on_network_filter_config_new(
 	hostConfigPtr C.envoy_dynamic_module_type_network_filter_config_envoy_ptr,
 	name C.envoy_dynamic_module_type_envoy_buffer,
 	config C.envoy_dynamic_module_type_envoy_buffer,
-) C.envoy_dynamic_module_type_network_filter_config_module_ptr {
+) (modulePtr C.envoy_dynamic_module_type_network_filter_config_module_ptr) {
+	defer recovery.Export("envoy_dynamic_module_on_network_filter_config_new", nil, &modulePtr)
 	nameString := envoyBufferToStringUnsafe(name)
 	configBytes := envoyBufferToBytesUnsafe(config)
 
@@ -997,6 +1061,7 @@ func envoy_dynamic_module_on_network_filter_config_new(
 func envoy_dynamic_module_on_network_filter_config_destroy(
 	configPtr C.envoy_dynamic_module_type_network_filter_config_module_ptr,
 ) {
+	defer recovery.ExportVoid("envoy_dynamic_module_on_network_filter_config_destroy")
 	configWrapper := networkConfigManager.unwrap(unsafe.Pointer(configPtr))
 	if configWrapper == nil {
 		return
@@ -1010,7 +1075,8 @@ func envoy_dynamic_module_on_network_filter_config_destroy(
 func envoy_dynamic_module_on_network_filter_new(
 	configPtr C.envoy_dynamic_module_type_network_filter_config_module_ptr,
 	hostPluginPtr C.envoy_dynamic_module_type_network_filter_envoy_ptr,
-) C.envoy_dynamic_module_type_network_filter_module_ptr {
+) (modulePtr C.envoy_dynamic_module_type_network_filter_module_ptr) {
+	defer recovery.Export("envoy_dynamic_module_on_network_filter_new", nil, &modulePtr)
 	configWrapper := networkConfigManager.unwrap(unsafe.Pointer(configPtr))
 	if configWrapper == nil {
 		return nil
@@ -1030,7 +1096,9 @@ func envoy_dynamic_module_on_network_filter_new(
 func envoy_dynamic_module_on_network_filter_new_connection(
 	filterEnvoyPtr C.envoy_dynamic_module_type_network_filter_envoy_ptr,
 	filterPtr C.envoy_dynamic_module_type_network_filter_module_ptr,
-) C.envoy_dynamic_module_type_on_network_filter_data_status {
+) (status C.envoy_dynamic_module_type_on_network_filter_data_status) {
+	defer recovery.Export("envoy_dynamic_module_on_network_filter_new_connection",
+		C.envoy_dynamic_module_type_on_network_filter_data_status_StopIteration, &status)
 	_ = filterEnvoyPtr
 	filterWrapper := networkPluginManager.unwrap(unsafe.Pointer(filterPtr))
 	if filterWrapper == nil || filterWrapper.plugin == nil || filterWrapper.filterDestroyed {
@@ -1049,7 +1117,9 @@ func envoy_dynamic_module_on_network_filter_read(
 	filterPtr C.envoy_dynamic_module_type_network_filter_module_ptr,
 	dataLength C.size_t,
 	endStream C.bool,
-) C.envoy_dynamic_module_type_on_network_filter_data_status {
+) (status C.envoy_dynamic_module_type_on_network_filter_data_status) {
+	defer recovery.Export("envoy_dynamic_module_on_network_filter_read",
+		C.envoy_dynamic_module_type_on_network_filter_data_status_StopIteration, &status)
 	_ = filterEnvoyPtr
 	_ = dataLength
 	filterWrapper := networkPluginManager.unwrap(unsafe.Pointer(filterPtr))
@@ -1069,7 +1139,9 @@ func envoy_dynamic_module_on_network_filter_write(
 	filterPtr C.envoy_dynamic_module_type_network_filter_module_ptr,
 	dataLength C.size_t,
 	endStream C.bool,
-) C.envoy_dynamic_module_type_on_network_filter_data_status {
+) (status C.envoy_dynamic_module_type_on_network_filter_data_status) {
+	defer recovery.Export("envoy_dynamic_module_on_network_filter_write",
+		C.envoy_dynamic_module_type_on_network_filter_data_status_StopIteration, &status)
 	_ = filterEnvoyPtr
 	_ = dataLength
 	filterWrapper := networkPluginManager.unwrap(unsafe.Pointer(filterPtr))
@@ -1089,6 +1161,7 @@ func envoy_dynamic_module_on_network_filter_event(
 	filterPtr C.envoy_dynamic_module_type_network_filter_module_ptr,
 	event C.envoy_dynamic_module_type_network_connection_event,
 ) {
+	defer recovery.ExportVoid("envoy_dynamic_module_on_network_filter_event")
 	_ = filterEnvoyPtr
 	filterWrapper := networkPluginManager.unwrap(unsafe.Pointer(filterPtr))
 	if filterWrapper == nil || filterWrapper.plugin == nil || filterWrapper.filterDestroyed {
@@ -1101,6 +1174,7 @@ func envoy_dynamic_module_on_network_filter_event(
 func envoy_dynamic_module_on_network_filter_destroy(
 	filterPtr C.envoy_dynamic_module_type_network_filter_module_ptr,
 ) {
+	defer recovery.ExportVoid("envoy_dynamic_module_on_network_filter_destroy")
 	filterWrapper := networkPluginManager.unwrap(unsafe.Pointer(filterPtr))
 	if filterWrapper == nil || filterWrapper.filterDestroyed {
 		return
@@ -1124,6 +1198,7 @@ func envoy_dynamic_module_on_network_filter_http_callout_done(
 	chunks *C.envoy_dynamic_module_type_envoy_buffer,
 	chunksSize C.size_t,
 ) {
+	defer recovery.ExportVoid("envoy_dynamic_module_on_network_filter_http_callout_done")
 	_ = filterEnvoyPtr
 	filterWrapper := networkPluginManager.unwrap(unsafe.Pointer(filterPtr))
 	if filterWrapper == nil || filterWrapper.filterDestroyed {
@@ -1146,6 +1221,7 @@ func envoy_dynamic_module_on_network_filter_scheduled(
 	filterPtr C.envoy_dynamic_module_type_network_filter_module_ptr,
 	taskID C.uint64_t,
 ) {
+	defer recovery.ExportVoid("envoy_dynamic_module_on_network_filter_scheduled")
 	_ = filterEnvoyPtr
 	filterWrapper := networkPluginManager.unwrap(unsafe.Pointer(filterPtr))
 	if filterWrapper == nil || filterWrapper.scheduler == nil || filterWrapper.filterDestroyed {
@@ -1159,6 +1235,7 @@ func envoy_dynamic_module_on_network_filter_config_scheduled(
 	configPtr C.envoy_dynamic_module_type_network_filter_config_module_ptr,
 	taskID C.uint64_t,
 ) {
+	defer recovery.ExportVoid("envoy_dynamic_module_on_network_filter_config_scheduled")
 	configWrapper := networkConfigManager.unwrap(unsafe.Pointer(configPtr))
 	if configWrapper == nil || configWrapper.configHandle == nil || configWrapper.configHandle.scheduler == nil {
 		return
@@ -1171,6 +1248,7 @@ func envoy_dynamic_module_on_network_filter_above_write_buffer_high_watermark(
 	filterEnvoyPtr C.envoy_dynamic_module_type_network_filter_envoy_ptr,
 	filterPtr C.envoy_dynamic_module_type_network_filter_module_ptr,
 ) {
+	defer recovery.ExportVoid("envoy_dynamic_module_on_network_filter_above_write_buffer_high_watermark")
 	_ = filterEnvoyPtr
 	filterWrapper := networkPluginManager.unwrap(unsafe.Pointer(filterPtr))
 	if filterWrapper == nil || filterWrapper.plugin == nil || filterWrapper.filterDestroyed {
@@ -1184,6 +1262,7 @@ func envoy_dynamic_module_on_network_filter_below_write_buffer_low_watermark(
 	filterEnvoyPtr C.envoy_dynamic_module_type_network_filter_envoy_ptr,
 	filterPtr C.envoy_dynamic_module_type_network_filter_module_ptr,
 ) {
+	defer recovery.ExportVoid("envoy_dynamic_module_on_network_filter_below_write_buffer_low_watermark")
 	_ = filterEnvoyPtr
 	filterWrapper := networkPluginManager.unwrap(unsafe.Pointer(filterPtr))
 	if filterWrapper == nil || filterWrapper.plugin == nil || filterWrapper.filterDestroyed {

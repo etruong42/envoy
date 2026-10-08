@@ -7,9 +7,11 @@
 
 #include "test/mocks/common.h"
 #include "test/mocks/grpc/mocks.h"
-#include "test/mocks/server/instance.h"
+#include "test/mocks/server/server_factory_context.h"
 #include "test/mocks/stats/mocks.h"
+#include "test/test_common/logging.h"
 
+#include "gmock/gmock.h"
 #include "gtest/gtest.h"
 
 using testing::_;
@@ -17,6 +19,8 @@ using testing::ByMove;
 using testing::NiceMock;
 using testing::Return;
 using testing::ReturnRef;
+
+using testing::Contains;
 
 namespace Envoy {
 namespace Extensions {
@@ -56,8 +60,8 @@ public:
       resource.attributes_[key] = value;
     }
     if (!metric_conversion_pbtext.empty()) {
-      Protobuf::TextFormat::ParseFromString(metric_conversion_pbtext,
-                                            sink_config.mutable_custom_metric_conversions());
+      std::ignore = Protobuf::TextFormat::ParseFromString(
+          metric_conversion_pbtext, sink_config.mutable_custom_metric_conversions());
     }
     return std::make_shared<OtlpOptions>(sink_config, resource, server_factory_context_);
   }
@@ -195,7 +199,7 @@ TEST_F(OpenTelemetryGrpcMetricsExporterImplTest, SendExportRequest) {
 }
 
 TEST_F(OpenTelemetryGrpcMetricsExporterImplTest, PartialSuccess) {
-  auto response = std::make_unique<MetricsExportResponse>();
+  auto response = Grpc::ResponsePtr<MetricsExportResponse>();
   response->mutable_partial_success()->set_rejected_data_points(1);
   exporter_->onSuccess(std::move(response), Tracing::NullSpan::instance());
 }
@@ -242,8 +246,9 @@ public:
             } else if (metric.has_histogram() && metric.histogram().data_points_size() > 0) {
               attributes = &metric.histogram().data_points()[0].attributes();
             }
-            if (attributes == nullptr)
+            if (attributes == nullptr) {
               return std::string("");
+            }
             std::vector<std::pair<std::string, std::string>> attrs;
             for (const auto& attr : *attributes) {
               attrs.push_back({attr.key(), attr.value().string_value()});
@@ -262,16 +267,18 @@ public:
   void sortDataPoints(opentelemetry::proto::metrics::v1::Metric& metric) {
     auto sort_by_attr = [](const auto& a, const auto& b) {
       auto get_attr_str = [](const auto& dp) {
-        if (dp.attributes().empty())
+        if (dp.attributes().empty()) {
           return std::string("");
+        }
         std::vector<std::string> attrs;
         for (const auto& attr : dp.attributes()) {
           attrs.push_back(attr.key() + "=" + attr.value().string_value());
         }
         std::sort(attrs.begin(), attrs.end());
         std::string res;
-        for (const auto& s : attrs)
+        for (const auto& s : attrs) {
           res += s + ";";
+        }
         return res;
       };
       return get_attr_str(a) < get_attr_str(b);
@@ -1513,8 +1520,8 @@ public:
 
     std::vector<double> supported_quantiles_;
     std::vector<double> computed_quantiles_;
-    std::vector<double> supported_buckets_{};
-    std::vector<uint64_t> computed_buckets_{};
+    std::vector<double> supported_buckets_;
+    std::vector<uint64_t> computed_buckets_;
     uint64_t sample_count_{0};
     double sample_sum_{0};
   };
@@ -1920,7 +1927,7 @@ TEST_F(RequestStreamerTests, TestMaxDatapointsPerRequestAggregationCounter) {
   for (const auto& req : requests_) {
     for (const auto& metric : req->resource_metrics(0).scope_metrics(0).metrics()) {
       for (const auto& dp : metric.sum().data_points()) {
-        EXPECT_EQ(expected_values.count(dp.as_int()), 1);
+        EXPECT_THAT(expected_values, Contains(dp.as_int()));
         expected_values.erase(dp.as_int());
       }
     }
@@ -1979,7 +1986,7 @@ TEST_F(RequestStreamerTests, TestMaxDatapointsPerRequestAggregationHistogram) {
   for (const auto& req : requests_) {
     for (const auto& metric : req->resource_metrics(0).scope_metrics(0).metrics()) {
       for (const auto& dp : metric.histogram().data_points()) {
-        EXPECT_EQ(expected_counts.count(dp.count()), 1);
+        EXPECT_THAT(expected_counts, Contains(dp.count()));
         expected_counts.erase(dp.count());
         if (dp.count() == 1) {
           EXPECT_EQ(dp.sum(), 10.0);

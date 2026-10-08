@@ -1,4 +1,3 @@
-load("@build_bazel_rules_apple//apple:apple.bzl", "apple_static_framework_import")
 load(
     "@com_github_buildbuddy_io_rules_xcodeproj//xcodeproj:defs.bzl",
     "project_options",
@@ -7,6 +6,7 @@ load(
     "xcodeproj",
 )
 load("@rules_android//android:rules.bzl", "aar_import")
+load("@rules_apple//apple:apple.bzl", "apple_static_framework_import")
 load("@rules_kotlin//kotlin/internal:toolchains.bzl", "define_kt_toolchain")
 load("//bazel:framework_imports_extractor.bzl", "framework_imports_extractor")
 
@@ -58,16 +58,17 @@ aar_import(
     name = "envoy_mobile_android",
     aar = "//library/kotlin/io/envoyproxy/envoymobile:envoy_aar",
     visibility = ["//visibility:public"],
+    deps = [
+        "@maven//:androidx_annotation_annotation",
+        "@maven//:androidx_core_core",
+        "@maven//:org_jetbrains_annotations",
+        "@maven//:org_jetbrains_kotlin_kotlin_stdlib",
+    ],
 )
 
 alias(
     name = "android_dist",
     actual = "//library/kotlin/io/envoyproxy/envoymobile:envoy_aar_with_artifacts",
-)
-
-alias(
-    name = "android_xds_dist",
-    actual = "//library/kotlin/io/envoyproxy/envoymobile:envoy_xds_aar_with_artifacts",
 )
 
 define_kt_toolchain(

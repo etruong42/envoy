@@ -7,6 +7,24 @@ use crate::{
   NEW_BOOTSTRAP_EXTENSION_CONFIG_FUNCTION,
 };
 use mockall::*;
+use std::panic::{catch_unwind, AssertUnwindSafe};
+
+/// The kind of active resource to enumerate with
+/// [`EnvoyBootstrapExtensionConfig::active_resource_names`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActiveResourceKind {
+  /// The named filter chains of the active listeners: inline chains, the default filter chain,
+  /// and FCDS chains that an active listener's matcher references and that are committed.
+  FilterChain,
+  /// The names of the active clusters.
+  Cluster,
+  /// The transport socket match names present in every active cluster that has matches. Clusters
+  /// with no matches do not constrain the result.
+  TransportSocketMatch,
+  /// The names of the delivered dynamic (SDS) secrets: TLS certificates, certificate validation
+  /// contexts, session ticket keys and generic secrets.
+  Secret,
+}
 
 /// EnvoyBootstrapExtensionConfig is the Envoy-side bootstrap extension configuration.
 /// This is a handle to the Envoy configuration object.
@@ -67,7 +85,7 @@ pub trait EnvoyBootstrapExtensionConfig {
   fn define_counter_vec<'a>(
     &mut self,
     name: &str,
-    labels: &[&'a str],
+    label_names: &[&'a str],
   ) -> Result<EnvoyCounterVecId, envoy_dynamic_module_type_metrics_result>;
 
   /// Define a new gauge scoped to this bootstrap extension config with the given name.
@@ -80,7 +98,7 @@ pub trait EnvoyBootstrapExtensionConfig {
   fn define_gauge_vec<'a>(
     &mut self,
     name: &str,
-    labels: &[&'a str],
+    label_names: &[&'a str],
   ) -> Result<EnvoyGaugeVecId, envoy_dynamic_module_type_metrics_result>;
 
   /// Define a new histogram scoped to this bootstrap extension config with the given name.
@@ -93,7 +111,7 @@ pub trait EnvoyBootstrapExtensionConfig {
   fn define_histogram_vec<'a>(
     &mut self,
     name: &str,
-    labels: &[&'a str],
+    label_names: &[&'a str],
   ) -> Result<EnvoyHistogramVecId, envoy_dynamic_module_type_metrics_result>;
 
   /// Increment the counter with the given id.
@@ -107,7 +125,7 @@ pub trait EnvoyBootstrapExtensionConfig {
   fn increment_counter_vec<'a>(
     &self,
     id: EnvoyCounterVecId,
-    labels: &[&'a str],
+    label_values: &[&'a str],
     value: u64,
   ) -> Result<(), envoy_dynamic_module_type_metrics_result>;
 
@@ -122,7 +140,7 @@ pub trait EnvoyBootstrapExtensionConfig {
   fn set_gauge_vec<'a>(
     &self,
     id: EnvoyGaugeVecId,
-    labels: &[&'a str],
+    label_values: &[&'a str],
     value: u64,
   ) -> Result<(), envoy_dynamic_module_type_metrics_result>;
 
@@ -137,7 +155,7 @@ pub trait EnvoyBootstrapExtensionConfig {
   fn increase_gauge_vec<'a>(
     &self,
     id: EnvoyGaugeVecId,
-    labels: &[&'a str],
+    label_values: &[&'a str],
     value: u64,
   ) -> Result<(), envoy_dynamic_module_type_metrics_result>;
 
@@ -152,7 +170,7 @@ pub trait EnvoyBootstrapExtensionConfig {
   fn decrease_gauge_vec<'a>(
     &self,
     id: EnvoyGaugeVecId,
-    labels: &[&'a str],
+    label_values: &[&'a str],
     value: u64,
   ) -> Result<(), envoy_dynamic_module_type_metrics_result>;
 
@@ -167,7 +185,7 @@ pub trait EnvoyBootstrapExtensionConfig {
   fn record_histogram_value_vec<'a>(
     &self,
     id: EnvoyHistogramVecId,
-    labels: &[&'a str],
+    label_values: &[&'a str],
     value: u64,
   ) -> Result<(), envoy_dynamic_module_type_metrics_result>;
 
@@ -246,6 +264,10 @@ pub trait EnvoyBootstrapExtensionConfig {
   ///
   /// This should be called at most once. Subsequent calls are no-ops and return `false`.
   fn enable_listener_lifecycle(&self) -> bool;
+
+  /// Returns the names of the currently active resources of the given kind, each at most once. See
+  /// [`ActiveResourceKind`] for what each kind reports. This must be called on the main thread.
+  fn active_resource_names(&self, kind: ActiveResourceKind) -> Vec<String>;
 }
 
 /// EnvoyBootstrapExtension is the Envoy-side bootstrap extension.
@@ -789,16 +811,16 @@ impl EnvoyBootstrapExtensionConfig for EnvoyBootstrapExtensionConfigImpl {
   fn define_counter_vec(
     &mut self,
     name: &str,
-    labels: &[&str],
+    label_names: &[&str],
   ) -> Result<EnvoyCounterVecId, envoy_dynamic_module_type_metrics_result> {
-    let mut label_bufs = strs_to_module_buffers(labels);
+    let mut label_names = strs_to_module_buffers(label_names);
     let mut id: usize = 0;
     Result::from(unsafe {
       abi::envoy_dynamic_module_callback_bootstrap_extension_config_define_counter(
         self.raw,
         str_to_module_buffer(name),
-        label_bufs.as_mut_ptr(),
-        label_bufs.len(),
+        label_names.as_mut_ptr(),
+        label_names.len(),
         &mut id,
       )
     })?;
@@ -825,16 +847,16 @@ impl EnvoyBootstrapExtensionConfig for EnvoyBootstrapExtensionConfigImpl {
   fn define_gauge_vec(
     &mut self,
     name: &str,
-    labels: &[&str],
+    label_names: &[&str],
   ) -> Result<EnvoyGaugeVecId, envoy_dynamic_module_type_metrics_result> {
-    let mut label_bufs = strs_to_module_buffers(labels);
+    let mut label_names = strs_to_module_buffers(label_names);
     let mut id: usize = 0;
     Result::from(unsafe {
       abi::envoy_dynamic_module_callback_bootstrap_extension_config_define_gauge(
         self.raw,
         str_to_module_buffer(name),
-        label_bufs.as_mut_ptr(),
-        label_bufs.len(),
+        label_names.as_mut_ptr(),
+        label_names.len(),
         &mut id,
       )
     })?;
@@ -861,16 +883,16 @@ impl EnvoyBootstrapExtensionConfig for EnvoyBootstrapExtensionConfigImpl {
   fn define_histogram_vec(
     &mut self,
     name: &str,
-    labels: &[&str],
+    label_names: &[&str],
   ) -> Result<EnvoyHistogramVecId, envoy_dynamic_module_type_metrics_result> {
-    let mut label_bufs = strs_to_module_buffers(labels);
+    let mut label_names = strs_to_module_buffers(label_names);
     let mut id: usize = 0;
     Result::from(unsafe {
       abi::envoy_dynamic_module_callback_bootstrap_extension_config_define_histogram(
         self.raw,
         str_to_module_buffer(name),
-        label_bufs.as_mut_ptr(),
-        label_bufs.len(),
+        label_names.as_mut_ptr(),
+        label_names.len(),
         &mut id,
       )
     })?;
@@ -902,17 +924,17 @@ impl EnvoyBootstrapExtensionConfig for EnvoyBootstrapExtensionConfigImpl {
   fn increment_counter_vec(
     &self,
     id: EnvoyCounterVecId,
-    labels: &[&str],
+    label_values: &[&str],
     value: u64,
   ) -> Result<(), envoy_dynamic_module_type_metrics_result> {
     let EnvoyCounterVecId(id) = id;
-    let mut label_bufs = strs_to_module_buffers(labels);
+    let mut label_values = strs_to_module_buffers(label_values);
     let res = unsafe {
       abi::envoy_dynamic_module_callback_bootstrap_extension_config_increment_counter(
         self.raw,
         id,
-        label_bufs.as_mut_ptr(),
-        label_bufs.len(),
+        label_values.as_mut_ptr(),
+        label_values.len(),
         value,
       )
     };
@@ -948,17 +970,17 @@ impl EnvoyBootstrapExtensionConfig for EnvoyBootstrapExtensionConfigImpl {
   fn set_gauge_vec(
     &self,
     id: EnvoyGaugeVecId,
-    labels: &[&str],
+    label_values: &[&str],
     value: u64,
   ) -> Result<(), envoy_dynamic_module_type_metrics_result> {
     let EnvoyGaugeVecId(id) = id;
-    let mut label_bufs = strs_to_module_buffers(labels);
+    let mut label_values = strs_to_module_buffers(label_values);
     let res = unsafe {
       abi::envoy_dynamic_module_callback_bootstrap_extension_config_set_gauge(
         self.raw,
         id,
-        label_bufs.as_mut_ptr(),
-        label_bufs.len(),
+        label_values.as_mut_ptr(),
+        label_values.len(),
         value,
       )
     };
@@ -994,17 +1016,17 @@ impl EnvoyBootstrapExtensionConfig for EnvoyBootstrapExtensionConfigImpl {
   fn increase_gauge_vec(
     &self,
     id: EnvoyGaugeVecId,
-    labels: &[&str],
+    label_values: &[&str],
     value: u64,
   ) -> Result<(), envoy_dynamic_module_type_metrics_result> {
     let EnvoyGaugeVecId(id) = id;
-    let mut label_bufs = strs_to_module_buffers(labels);
+    let mut label_values = strs_to_module_buffers(label_values);
     let res = unsafe {
       abi::envoy_dynamic_module_callback_bootstrap_extension_config_increment_gauge(
         self.raw,
         id,
-        label_bufs.as_mut_ptr(),
-        label_bufs.len(),
+        label_values.as_mut_ptr(),
+        label_values.len(),
         value,
       )
     };
@@ -1040,17 +1062,17 @@ impl EnvoyBootstrapExtensionConfig for EnvoyBootstrapExtensionConfigImpl {
   fn decrease_gauge_vec(
     &self,
     id: EnvoyGaugeVecId,
-    labels: &[&str],
+    label_values: &[&str],
     value: u64,
   ) -> Result<(), envoy_dynamic_module_type_metrics_result> {
     let EnvoyGaugeVecId(id) = id;
-    let mut label_bufs = strs_to_module_buffers(labels);
+    let mut label_values = strs_to_module_buffers(label_values);
     let res = unsafe {
       abi::envoy_dynamic_module_callback_bootstrap_extension_config_decrement_gauge(
         self.raw,
         id,
-        label_bufs.as_mut_ptr(),
-        label_bufs.len(),
+        label_values.as_mut_ptr(),
+        label_values.len(),
         value,
       )
     };
@@ -1086,17 +1108,17 @@ impl EnvoyBootstrapExtensionConfig for EnvoyBootstrapExtensionConfigImpl {
   fn record_histogram_value_vec(
     &self,
     id: EnvoyHistogramVecId,
-    labels: &[&str],
+    label_values: &[&str],
     value: u64,
   ) -> Result<(), envoy_dynamic_module_type_metrics_result> {
     let EnvoyHistogramVecId(id) = id;
-    let mut label_bufs = strs_to_module_buffers(labels);
+    let mut label_values = strs_to_module_buffers(label_values);
     let res = unsafe {
       abi::envoy_dynamic_module_callback_bootstrap_extension_config_record_histogram_value(
         self.raw,
         id,
-        label_bufs.as_mut_ptr(),
-        label_bufs.len(),
+        label_values.as_mut_ptr(),
+        label_values.len(),
         value,
       )
     };
@@ -1161,6 +1183,44 @@ impl EnvoyBootstrapExtensionConfig for EnvoyBootstrapExtensionConfigImpl {
     unsafe {
       abi::envoy_dynamic_module_callback_bootstrap_extension_enable_listener_lifecycle(self.raw)
     }
+  }
+
+  fn active_resource_names(&self, kind: ActiveResourceKind) -> Vec<String> {
+    extern "C" fn name_trampoline(
+      name: abi::envoy_dynamic_module_type_envoy_buffer,
+      user_data: *mut std::ffi::c_void,
+    ) {
+      let names = unsafe { &mut *(user_data as *mut Vec<String>) };
+      let name_slice =
+        unsafe { crate::ffi_helpers::slice_from_raw_or_empty(name.ptr as *const u8, name.length) };
+      names.push(std::str::from_utf8(name_slice).unwrap_or("").to_owned());
+    }
+
+    let abi_kind = match kind {
+      ActiveResourceKind::FilterChain => {
+        abi::envoy_dynamic_module_type_bootstrap_active_resource_kind::FilterChain
+      },
+      ActiveResourceKind::Cluster => {
+        abi::envoy_dynamic_module_type_bootstrap_active_resource_kind::Cluster
+      },
+      ActiveResourceKind::TransportSocketMatch => {
+        abi::envoy_dynamic_module_type_bootstrap_active_resource_kind::TransportSocketMatch
+      },
+      ActiveResourceKind::Secret => {
+        abi::envoy_dynamic_module_type_bootstrap_active_resource_kind::Secret
+      },
+    };
+
+    let mut names: Vec<String> = Vec::new();
+    unsafe {
+      abi::envoy_dynamic_module_callback_bootstrap_extension_get_active_resource_names(
+        self.raw,
+        abi_kind,
+        Some(name_trampoline),
+        &mut names as *mut _ as *mut std::ffi::c_void,
+      );
+    }
+    names
   }
 }
 
@@ -1246,11 +1306,18 @@ impl EnvoyBootstrapExtension for EnvoyBootstrapExtensionImpl {
       let name_slice =
         unsafe { crate::ffi_helpers::slice_from_raw_or_empty(name.ptr as *const u8, name.length) };
       let name_str = std::str::from_utf8(name_slice).unwrap_or("");
-      if (wrapper.callback)(name_str, value) {
-        abi::envoy_dynamic_module_type_stats_iteration_action::Continue
-      } else {
-        wrapper.stopped = true;
-        abi::envoy_dynamic_module_type_stats_iteration_action::Stop
+      // Catch panics so a panicking visitor never unwinds across the C boundary and aborts Envoy.
+      match catch_unwind(AssertUnwindSafe(|| (wrapper.callback)(name_str, value))) {
+        Ok(true) => abi::envoy_dynamic_module_type_stats_iteration_action::Continue,
+        Ok(false) => {
+          wrapper.stopped = true;
+          abi::envoy_dynamic_module_type_stats_iteration_action::Stop
+        },
+        Err(panic) => {
+          crate::log_ffi_panic("bootstrap_extension_iterate_counters", panic);
+          wrapper.stopped = true;
+          abi::envoy_dynamic_module_type_stats_iteration_action::Stop
+        },
       }
     }
 
@@ -1286,11 +1353,18 @@ impl EnvoyBootstrapExtension for EnvoyBootstrapExtensionImpl {
       let name_slice =
         unsafe { crate::ffi_helpers::slice_from_raw_or_empty(name.ptr as *const u8, name.length) };
       let name_str = std::str::from_utf8(name_slice).unwrap_or("");
-      if (wrapper.callback)(name_str, value) {
-        abi::envoy_dynamic_module_type_stats_iteration_action::Continue
-      } else {
-        wrapper.stopped = true;
-        abi::envoy_dynamic_module_type_stats_iteration_action::Stop
+      // Catch panics so a panicking visitor never unwinds across the C boundary and aborts Envoy.
+      match catch_unwind(AssertUnwindSafe(|| (wrapper.callback)(name_str, value))) {
+        Ok(true) => abi::envoy_dynamic_module_type_stats_iteration_action::Continue,
+        Ok(false) => {
+          wrapper.stopped = true;
+          abi::envoy_dynamic_module_type_stats_iteration_action::Stop
+        },
+        Err(panic) => {
+          crate::log_ffi_panic("bootstrap_extension_iterate_gauges", panic);
+          wrapper.stopped = true;
+          abi::envoy_dynamic_module_type_stats_iteration_action::Stop
+        },
       }
     }
 

@@ -743,6 +743,10 @@ impl<EHF: EnvoyHttpFilter> HttpFilter<EHF> for SpanCallbacksFilter {
   ) -> abi::envoy_dynamic_module_type_on_http_filter_request_headers_status {
     if let Some(span) = envoy_filter.get_active_span() {
       span.set_tag("key", "value");
+      span.set_tags(&[
+        ("batch.key1", "batch.value1"),
+        ("batch.key2", "batch.value2"),
+      ]);
       span.set_operation("operation");
       span.log("event");
       span.set_sampled(true);
@@ -1218,7 +1222,11 @@ impl<EHF: EnvoyHttpFilter> HttpFilter<EHF> for FilterStateCallbacksFilter {
     let ok = envoy_filter.set_filter_state_typed(b"no.such.factory", b"value");
     assert!(!ok);
 
+    assert!(envoy_filter.has_filter_state(b"envoy.test.http_typed_object_for_rust"));
+    assert!(!envoy_filter.has_filter_state(b"nonexistent_key"));
+
     envoy_filter.set_filter_state_bytes(b"req_header_key", b"req_header_value");
+    assert!(envoy_filter.has_filter_state(b"req_header_key"));
     let filter_state = envoy_filter.get_filter_state_bytes(b"req_header_key");
     assert!(filter_state.is_some());
     assert_eq!(filter_state.unwrap().as_slice(), b"req_header_value");

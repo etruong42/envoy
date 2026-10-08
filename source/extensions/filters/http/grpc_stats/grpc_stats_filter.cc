@@ -264,10 +264,10 @@ public:
       return;
     }
     if (filter_object_ == nullptr) {
-      auto state = std::make_unique<GrpcStatsObject>();
+      auto state = std::make_shared<GrpcStatsObject>();
       filter_object_ = state.get();
-      decoder_callbacks_->streamInfo().filterState()->setData(
-          "envoy.filters.http.grpc_stats", std::move(state),
+      decoder_callbacks_->streamInfo().filterState()->setIndexedData(
+          StreamInfo::FilterStateIndex::HttpGrpcStats, "envoy.filters.http.grpc_stats", state,
           StreamInfo::FilterState::LifeSpan::FilterChain);
     }
     if (connect_unary_) {

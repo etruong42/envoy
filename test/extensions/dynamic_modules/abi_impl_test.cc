@@ -474,6 +474,121 @@ TEST(CommonAbiImplTest, SharedDataRegistryMultipleKeys) {
 }
 
 // =============================================================================
+// Runtime Tests
+// =============================================================================
+
+TEST(CommonAbiImplTest, GetRuntimeBoolReturnsConfiguredValue) {
+  testing::NiceMock<Server::Configuration::MockServerFactoryContext> context;
+  EXPECT_CALL(context.runtime_loader_.snapshot_, getBoolean(absl::string_view("some.flag"), false))
+      .WillOnce(Return(true));
+
+  ScopedThreadLocalServerContextSetter setter(context);
+  envoy_dynamic_module_type_module_buffer key = {"some.flag", 9};
+  EXPECT_TRUE(envoy_dynamic_module_callback_get_runtime_bool(key, false));
+}
+
+TEST(CommonAbiImplTest, GetRuntimeIntReturnsConfiguredValue) {
+  testing::NiceMock<Server::Configuration::MockServerFactoryContext> context;
+  EXPECT_CALL(context.runtime_loader_.snapshot_, getInteger(absl::string_view("some.limit"), 7))
+      .WillOnce(Return(42));
+
+  ScopedThreadLocalServerContextSetter setter(context);
+  envoy_dynamic_module_type_module_buffer key = {"some.limit", 10};
+  EXPECT_EQ(42u, envoy_dynamic_module_callback_get_runtime_int(key, 7));
+}
+
+TEST(CommonAbiImplTest, GetRuntimeNumberReturnsConfiguredValue) {
+  testing::NiceMock<Server::Configuration::MockServerFactoryContext> context;
+  EXPECT_CALL(context.runtime_loader_.snapshot_, getDouble(absl::string_view("some.ratio"), 0.5))
+      .WillOnce(Return(0.25));
+
+  ScopedThreadLocalServerContextSetter setter(context);
+  envoy_dynamic_module_type_module_buffer key = {"some.ratio", 10};
+  EXPECT_DOUBLE_EQ(0.25, envoy_dynamic_module_callback_get_runtime_number(key, 0.5));
+}
+
+// Verifies that the number callback reads a negative value, which the integer callback stores no
+// integer for and would therefore answer with its default. This is the reason it exists alongside
+// the integer callback.
+TEST(CommonAbiImplTest, GetRuntimeNumberReadsNegativeValue) {
+  testing::NiceMock<Server::Configuration::MockServerFactoryContext> context;
+  EXPECT_CALL(context.runtime_loader_.snapshot_, getDouble(absl::string_view("some.ratio"), 0))
+      .WillOnce(Return(-1.5));
+
+  ScopedThreadLocalServerContextSetter setter(context);
+  envoy_dynamic_module_type_module_buffer key = {"some.ratio", 10};
+  EXPECT_DOUBLE_EQ(-1.5, envoy_dynamic_module_callback_get_runtime_number(key, 0));
+}
+
+// Verifies that the key buffer is forwarded using its explicit length rather than being treated as
+// a null terminated string, since module buffers are not required to be null terminated.
+TEST(CommonAbiImplTest, GetRuntimeKeyHonorsBufferLength) {
+  testing::NiceMock<Server::Configuration::MockServerFactoryContext> context;
+  EXPECT_CALL(context.runtime_loader_.snapshot_, getBoolean(absl::string_view("some.flag"), false))
+      .WillOnce(Return(true));
+  EXPECT_CALL(context.runtime_loader_.snapshot_, getInteger(absl::string_view("some.flag"), 0))
+      .WillOnce(Return(5));
+  EXPECT_CALL(context.runtime_loader_.snapshot_, getDouble(absl::string_view("some.flag"), 0))
+      .WillOnce(Return(1.5));
+
+  ScopedThreadLocalServerContextSetter setter(context);
+  // Only the first 9 bytes form the key; the trailing bytes must be ignored.
+  envoy_dynamic_module_type_module_buffer key = {"some.flag.and.then.some", 9};
+  EXPECT_TRUE(envoy_dynamic_module_callback_get_runtime_bool(key, false));
+  EXPECT_EQ(5u, envoy_dynamic_module_callback_get_runtime_int(key, 0));
+  EXPECT_DOUBLE_EQ(1.5, envoy_dynamic_module_callback_get_runtime_number(key, 0));
+}
+
+// Verifies that a key the runtime does not know about yields the caller supplied default, which
+// the snapshot itself is responsible for returning.
+TEST(CommonAbiImplTest, GetRuntimeMissingKeyReturnsDefault) {
+  testing::NiceMock<Server::Configuration::MockServerFactoryContext> context;
+  ON_CALL(context.runtime_loader_.snapshot_, getBoolean(testing::_, testing::_))
+      .WillByDefault(testing::ReturnArg<1>());
+  ON_CALL(context.runtime_loader_.snapshot_, getInteger(testing::_, testing::_))
+      .WillByDefault(testing::ReturnArg<1>());
+  ON_CALL(context.runtime_loader_.snapshot_, getDouble(testing::_, testing::_))
+      .WillByDefault(testing::ReturnArg<1>());
+
+  ScopedThreadLocalServerContextSetter setter(context);
+  envoy_dynamic_module_type_module_buffer key = {"missing.key", 11};
+  EXPECT_TRUE(envoy_dynamic_module_callback_get_runtime_bool(key, true));
+  EXPECT_FALSE(envoy_dynamic_module_callback_get_runtime_bool(key, false));
+  EXPECT_EQ(1234u, envoy_dynamic_module_callback_get_runtime_int(key, 1234));
+  EXPECT_DOUBLE_EQ(2.5, envoy_dynamic_module_callback_get_runtime_number(key, 2.5));
+}
+
+// Verifies that the callbacks fall back to the caller supplied default, rather than failing
+// closed on a fixed value, when the server context has not been installed.
+TEST(CommonAbiImplTest, GetRuntimeBeforeServerContextReturnsDefault) {
+  envoy_dynamic_module_type_module_buffer key = {"some.flag", 9};
+  EXPECT_TRUE(envoy_dynamic_module_callback_get_runtime_bool(key, true));
+  EXPECT_FALSE(envoy_dynamic_module_callback_get_runtime_bool(key, false));
+  EXPECT_EQ(99u, envoy_dynamic_module_callback_get_runtime_int(key, 99));
+  EXPECT_DOUBLE_EQ(9.5, envoy_dynamic_module_callback_get_runtime_number(key, 9.5));
+}
+
+// Verifies that calling off the main thread is legal and simply yields the default. The server
+// context is a thread local singleton installed only on the main thread, so a worker thread finds
+// no context; unlike the main-thread-only callbacks this must not trip an ENVOY_BUG.
+TEST(CommonAbiImplTest, GetRuntimeOffMainThreadReturnsDefaultWithoutEnvoyBug) {
+  testing::NiceMock<Server::Configuration::MockServerFactoryContext> context;
+  EXPECT_CALL(context.runtime_loader_.snapshot_, getBoolean(testing::_, testing::_)).Times(0);
+  EXPECT_CALL(context.runtime_loader_.snapshot_, getInteger(testing::_, testing::_)).Times(0);
+  EXPECT_CALL(context.runtime_loader_.snapshot_, getDouble(testing::_, testing::_)).Times(0);
+
+  ScopedThreadLocalServerContextSetter setter(context);
+  std::thread t([] {
+    envoy_dynamic_module_type_module_buffer key = {"some.flag", 9};
+    EXPECT_TRUE(envoy_dynamic_module_callback_get_runtime_bool(key, true));
+    EXPECT_FALSE(envoy_dynamic_module_callback_get_runtime_bool(key, false));
+    EXPECT_EQ(7u, envoy_dynamic_module_callback_get_runtime_int(key, 7));
+    EXPECT_DOUBLE_EQ(3.5, envoy_dynamic_module_callback_get_runtime_number(key, 3.5));
+  });
+  t.join();
+}
+
+// =============================================================================
 // Weak symbol stub tests for network filter, listener filter, access logger, and
 // UDP listener filter callbacks. These verify that the weak stubs installed in
 // abi_impl.cc trigger ENVOY_BUG when called from a context that does not compile
@@ -590,6 +705,12 @@ WEAK_STUB(CertValidatorGetFilterState,
           envoy_dynamic_module_callback_cert_validator_get_filter_state(nullptr, {nullptr, 0},
                                                                         nullptr))
 
+WEAK_STUB(ConfigValidatorSetRejectionMessage,
+          envoy_dynamic_module_callback_config_validator_set_rejection_message(nullptr,
+                                                                               {nullptr, 0}))
+WEAK_STUB(ConfigValidatorGetDynamicClusterCount,
+          envoy_dynamic_module_callback_config_validator_get_dynamic_cluster_count(nullptr))
+
 WEAK_STUB(ClusterAddHosts,
           envoy_dynamic_module_callback_cluster_add_hosts(nullptr, 0, nullptr, nullptr, nullptr,
                                                           nullptr, nullptr, nullptr, 0, 0, nullptr))
@@ -601,6 +722,8 @@ WEAK_STUB(ClusterAddHostsWithHostnames,
 WEAK_STUB(ClusterRemoveHosts,
           envoy_dynamic_module_callback_cluster_remove_hosts(nullptr, nullptr, 0))
 WEAK_STUB(ClusterPreInitComplete, envoy_dynamic_module_callback_cluster_pre_init_complete(nullptr))
+WEAK_STUB(ClusterUsePersistentHostMap,
+          envoy_dynamic_module_callback_cluster_use_persistent_host_map(nullptr))
 WEAK_STUB(ClusterLbGetHealthyHostCount,
           envoy_dynamic_module_callback_cluster_lb_get_healthy_host_count(nullptr, 0))
 WEAK_STUB(ClusterLbGetHealthyHost,
@@ -879,6 +1002,7 @@ WEAK_STUB(MatcherGetHeaderValue,
           envoy_dynamic_module_callback_matcher_get_header_value(
               nullptr, envoy_dynamic_module_type_http_header_type_RequestHeader, {nullptr, 0},
               nullptr, 0, nullptr))
+WEAK_STUB(MatcherSetError, envoy_dynamic_module_callback_matcher_set_error(nullptr))
 WEAK_STUB(MatcherDataInputGetHeaderValue,
           envoy_dynamic_module_callback_matcher_data_input_get_header_value(
               nullptr, envoy_dynamic_module_type_http_header_type_RequestHeader, {nullptr, 0},
@@ -942,8 +1066,12 @@ WEAK_STUB(ListenerFilterConfigSchedulerCommit,
           envoy_dynamic_module_callback_listener_filter_config_scheduler_commit(nullptr, 0))
 WEAK_STUB(AccessLoggerGetBytesInfo,
           envoy_dynamic_module_callback_access_logger_get_bytes_info(nullptr, nullptr))
+WEAK_STUB(AccessLoggerGetDownstreamWireBytes,
+          envoy_dynamic_module_callback_access_logger_get_downstream_wire_bytes(nullptr, nullptr))
 WEAK_STUB(AccessLoggerGetTimingInfo,
           envoy_dynamic_module_callback_access_logger_get_timing_info(nullptr, nullptr))
+WEAK_STUB(AccessLoggerGetTimingInfoV2,
+          envoy_dynamic_module_callback_access_logger_get_timing_info_v2(nullptr, nullptr))
 WEAK_STUB(ListenerFilterCloseSocket,
           envoy_dynamic_module_callback_listener_filter_close_socket(nullptr, {nullptr, 0}))
 WEAK_STUB(ListenerFilterSetDownstreamTransportFailureReason,
@@ -1696,6 +1824,16 @@ WEAK_STUB(StatSinkSnapshotGetTextReadout,
 WEAK_STUB(StatSinkSnapshotGetCounterTagExtractedName,
           envoy_dynamic_module_callback_stat_sink_snapshot_get_counter_tag_extracted_name(
               nullptr, 0, nullptr, 0, nullptr))
+WEAK_STUB(StatSinkSnapshotGetHistogramTagExtractedName,
+          envoy_dynamic_module_callback_stat_sink_snapshot_get_histogram_tag_extracted_name(
+              nullptr, 0, nullptr, 0, nullptr))
+WEAK_STUB(StatSinkSnapshotGetHistogramTagCount,
+          envoy_dynamic_module_callback_stat_sink_snapshot_get_histogram_tag_count(nullptr, 0,
+                                                                                   nullptr))
+WEAK_STUB(StatSinkSnapshotGetHistogramTag,
+          envoy_dynamic_module_callback_stat_sink_snapshot_get_histogram_tag(nullptr, 0, 0, nullptr,
+                                                                             0, nullptr, nullptr, 0,
+                                                                             nullptr))
 WEAK_STUB(StatSinkSnapshotGetCounterTagCount,
           envoy_dynamic_module_callback_stat_sink_snapshot_get_counter_tag_count(nullptr, 0,
                                                                                  nullptr))
@@ -1836,6 +1974,9 @@ WEAK_STUB(HttpSetDynamicMetadataStruct,
 WEAK_STUB(HttpSetDynamicTypedMetadata,
           envoy_dynamic_module_callback_http_set_dynamic_typed_metadata(nullptr, {nullptr, 0},
                                                                         {nullptr, 0}))
+WEAK_STUB(HttpGetTypedMetadata, envoy_dynamic_module_callback_http_get_typed_metadata(
+                                    nullptr, envoy_dynamic_module_type_metadata_source_Dynamic,
+                                    {nullptr, 0}, nullptr, nullptr))
 WEAK_STUB(HttpGetMetadataString, envoy_dynamic_module_callback_http_get_metadata_string(
                                      nullptr, envoy_dynamic_module_type_metadata_source_Dynamic,
                                      {nullptr, 0}, {nullptr, 0}, nullptr))
@@ -1896,6 +2037,7 @@ WEAK_STUB(HttpFilterGetAttributeInt,
 WEAK_STUB(HttpFilterGetAttributeBool,
           envoy_dynamic_module_callback_http_filter_get_attribute_bool(
               nullptr, envoy_dynamic_module_type_attribute_id_RequestPath, nullptr))
+WEAK_STUB(HttpGetTimingInfo, envoy_dynamic_module_callback_http_get_timing_info(nullptr, nullptr))
 WEAK_STUB(NetworkFilterGetAttributeString,
           envoy_dynamic_module_callback_network_filter_get_attribute_string(
               nullptr, envoy_dynamic_module_type_attribute_id_RequestPath, nullptr))
@@ -1971,6 +2113,8 @@ WEAK_STUB(HttpSetBufferLimit, envoy_dynamic_module_callback_http_set_buffer_limi
 WEAK_STUB(HttpGetActiveSpan, envoy_dynamic_module_callback_http_get_active_span(nullptr))
 WEAK_STUB(HttpSpanSetTag,
           envoy_dynamic_module_callback_http_span_set_tag(nullptr, {nullptr, 0}, {nullptr, 0}))
+WEAK_STUB(HttpSpanSetTagBatch,
+          envoy_dynamic_module_callback_http_span_set_tag_batch(nullptr, nullptr, 0))
 WEAK_STUB(HttpSpanSetOperation,
           envoy_dynamic_module_callback_http_span_set_operation(nullptr, {nullptr, 0}))
 WEAK_STUB(HttpSpanLog, envoy_dynamic_module_callback_http_span_log(nullptr, nullptr, {nullptr, 0}))
@@ -1996,6 +2140,17 @@ WEAK_STUB(HttpSetUpstreamOverrideHost,
                                                                         false))
 WEAK_STUB(HttpGetUpstreamConnectionId,
           envoy_dynamic_module_callback_http_get_upstream_connection_id(nullptr))
+WEAK_STUB(HttpGetUpstreamRemoteAddress,
+          envoy_dynamic_module_callback_http_get_upstream_remote_address(nullptr, nullptr))
+WEAK_STUB(HttpGetUpstreamHostsAttemptedSize,
+          envoy_dynamic_module_callback_http_get_upstream_hosts_attempted_size(nullptr))
+WEAK_STUB(HttpGetUpstreamHostsAttempted,
+          envoy_dynamic_module_callback_http_get_upstream_hosts_attempted(nullptr, nullptr))
+WEAK_STUB(HttpGetUpstreamConnectionIdsAttemptedSize,
+          envoy_dynamic_module_callback_http_get_upstream_connection_ids_attempted_size(nullptr))
+WEAK_STUB(HttpGetUpstreamConnectionIdsAttempted,
+          envoy_dynamic_module_callback_http_get_upstream_connection_ids_attempted(nullptr,
+                                                                                   nullptr))
 WEAK_STUB(HttpFilterResetStream,
           envoy_dynamic_module_callback_http_filter_reset_stream(
               nullptr, envoy_dynamic_module_type_http_filter_stream_reset_reason_LocalReset,

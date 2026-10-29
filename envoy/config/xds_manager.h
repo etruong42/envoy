@@ -22,6 +22,8 @@
 namespace Envoy {
 namespace Config {
 
+class XdsSymbolTable;
+
 /**
  * An xDS-Manager interface for all operations related to xDS connections and
  * resources in Envoy.
@@ -146,6 +148,13 @@ public:
    * @return Config::SubscriptionFactory& the subscription factory.
    */
   virtual SubscriptionFactory& subscriptionFactory() PURE;
+
+  /**
+   * Obtain the server-wide symbol table used for compressing xDS resource names.
+   *
+   * @return XdsSymbolTable& the xDS symbol table.
+   */
+  virtual XdsSymbolTable& xdsSymbolTable() PURE;
 };
 
 using XdsManagerPtr = std::unique_ptr<XdsManager>;

@@ -360,6 +360,7 @@ envoy_cc_library(
         ":null_grpc_mux_lib",
         ":subscription_factory_lib",
         ":utility_lib",
+        ":xds_symbol_table_lib",
         "//envoy/config:xds_manager_interface",
         "//envoy/upstream:cluster_manager_interface",
         "//source/common/common:thread_lib",

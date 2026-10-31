@@ -334,3 +334,38 @@ envoy_extension_benchmark_test(
     benchmark_binary = "eds_resources_cache_impl_benchmark",
     extension_names = ["envoy.config_subscription.grpc"],
 )
+
+envoy_extension_cc_benchmark_binary(
+    name = "xds_subscription_compression_benchmark",
+    srcs = ["xds_subscription_compression_benchmark.cc"],
+    extension_names = ["envoy.config_subscription.grpc"],
+    rbe_pool = "linux_x64_small",
+    deps = [
+        "//envoy/config:custom_config_validators_interface",
+        "//envoy/config:subscription_interface",
+        "//envoy/grpc:status",
+        "//source/common/common:assert_lib",
+        "//source/common/common:empty_string",
+        "//source/common/config:xds_symbol_table_lib",
+        "//source/common/event:libevent_lib",
+        "//source/common/memory:stats_lib",
+        "//source/common/runtime:runtime_features_lib",
+        "//source/extensions/config_subscription/grpc:delta_subscription_state_lib",
+        "//source/extensions/config_subscription/grpc:watch_map_lib",
+        "//source/extensions/config_subscription/grpc/xds_mux:delta_subscription_state_lib",
+        "//source/extensions/config_subscription/grpc/xds_mux:sotw_subscription_state_lib",
+        "//test/test_common:simulated_time_system_lib",
+        "//test/test_common:utility_lib",
+        "@abseil-cpp//absl/container:flat_hash_set",
+        "@abseil-cpp//absl/strings",
+        "@abseil-cpp//absl/strings:str_format",
+        "@benchmark",
+        "@envoy_api//envoy/service/discovery/v3:pkg_cc_proto",
+    ],
+)
+
+envoy_extension_benchmark_test(
+    name = "xds_subscription_compression_benchmark_test",
+    benchmark_binary = "xds_subscription_compression_benchmark",
+    extension_names = ["envoy.config_subscription.grpc"],
+)

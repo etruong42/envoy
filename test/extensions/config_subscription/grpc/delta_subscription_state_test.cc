@@ -5,6 +5,7 @@
 #include "envoy/service/discovery/v3/discovery.pb.h"
 
 #include "source/common/config/utility.h"
+#include "source/common/config/xds_symbol_table.h"
 #include "source/common/stats/isolated_store_impl.h"
 #include "source/extensions/config_subscription/grpc/delta_subscription_state.h"
 #include "source/extensions/config_subscription/grpc/xds_mux/delta_subscription_state.h"
@@ -38,7 +39,7 @@ const auto WildcardStr = std::string(Wildcard);
 
 struct DeltaSubscriptionStateTestParams {
   LegacyOrUnified legacy_or_unified;
-  bool skip_subsequent_node;
+  bool compress_resource_names;
 };
 
 Protobuf::RepeatedPtrField<envoy::service::discovery::v3::Resource>
@@ -66,7 +67,10 @@ class DeltaSubscriptionStateTestBase
 protected:
   DeltaSubscriptionStateTestBase(const std::string& type_url,
                                  const DeltaSubscriptionStateTestParams& params)
-      : should_use_unified_(params.legacy_or_unified == LegacyOrUnified::Unified) {
+      : should_use_unified_(params.legacy_or_unified == LegacyOrUnified::Unified),
+        compress_resource_names_(params.compress_resource_names) {
+    scoped_runtime_.mergeValues({{"envoy.reloadable_features.compress_xds_resource_names",
+                                  compress_resource_names_ ? "true" : "false"}});
     ttl_timer_ = new Event::MockTimer(&dispatcher_);
 
     if (should_use_unified_) {
@@ -184,6 +188,7 @@ protected:
     return absl::get<0>(state_)->subscriptionUpdatePending();
   }
 
+  TestScopedRuntime scoped_runtime_;
   NiceMock<MockUntypedConfigUpdateCallbacks> callbacks_;
   NiceMock<LocalInfo::MockLocalInfo> local_info_;
   NiceMock<Event::MockDispatcher> dispatcher_;
@@ -193,6 +198,7 @@ protected:
                 std::unique_ptr<Envoy::Config::XdsMux::DeltaSubscriptionState>>
       state_;
   bool should_use_unified_;
+  bool compress_resource_names_;
 };
 
 class DeltaSubscriptionStateTestBlank : public DeltaSubscriptionStateTestBase {
@@ -1448,8 +1454,6 @@ TEST_P(VhdsDeltaSubscriptionStateTest, ResourceTTL) {
   Event::SimulatedTimeSystem time_system;
   time_system.setSystemTime(std::chrono::milliseconds(0));
 
-  TestScopedRuntime scoped_runtime;
-
   auto create_resource_with_ttl = [](bool include_resource) {
     Protobuf::RepeatedPtrField<envoy::service::discovery::v3::Resource> added_resources;
     auto* resource = added_resources.Add();
@@ -1474,6 +1478,203 @@ TEST_P(VhdsDeltaSubscriptionStateTest, ResourceTTL) {
   // Heartbeat update should not be propagated to the subscription callback.
   EXPECT_CALL(*ttl_timer_, enabled());
   deliverDiscoveryResponse(create_resource_with_ttl(false), {}, "debug1", "nonce1", true, 1);
+}
+
+// Verifies shared `XdsSymbolTable` deduplication across delta subscription states, protection
+// against symbol pollution on unsolicited resources/heartbeats/removals, state transitions
+// (`requested` <-> `ambiguous` <-> `wildcard`), and full symbol reclamation.
+TEST_P(DeltaSubscriptionStateTestBlank, SharedSymbolTableLifecycleAndNoPollution) {
+  Event::SimulatedTimeSystem time_system;
+  time_system.setSystemTime(std::chrono::milliseconds(0));
+
+  auto symbol_table = XdsSymbolTable::create();
+  const size_t initial_active = symbol_table->numActiveSymbols();
+  const size_t initial_total = symbol_table->numSymbols();
+
+  NiceMock<MockUntypedConfigUpdateCallbacks> callbacks_a;
+  NiceMock<MockUntypedConfigUpdateCallbacks> callbacks_b;
+  NiceMock<Event::MockDispatcher> dispatcher_a;
+  NiceMock<Event::MockDispatcher> dispatcher_b;
+  auto* ttl_timer_a = new NiceMock<Event::MockTimer>(&dispatcher_a);
+  std::ignore = new NiceMock<Event::MockTimer>(&dispatcher_b);
+
+  absl::variant<std::unique_ptr<Envoy::Config::DeltaSubscriptionState>,
+                std::unique_ptr<Envoy::Config::XdsMux::DeltaSubscriptionState>>
+      state_a;
+  absl::variant<std::unique_ptr<Envoy::Config::DeltaSubscriptionState>,
+                std::unique_ptr<Envoy::Config::XdsMux::DeltaSubscriptionState>>
+      state_b;
+
+  if (should_use_unified_) {
+    XdsMux::DeltaSubscriptionStateFactory factory_a(dispatcher_a, makeOptRef(*symbol_table));
+    XdsMux::DeltaSubscriptionStateFactory factory_b(dispatcher_b, makeOptRef(*symbol_table));
+    state_a = factory_a.makeSubscriptionState(
+        TypeUrl, callbacks_a, nullptr, XdsConfigTrackerOptRef(), XdsResourcesDelegateOptRef(), "");
+    state_b = factory_b.makeSubscriptionState(
+        "type.googleapis.com/envoy.config.endpoint.v3.ClusterLoadAssignment", callbacks_b, nullptr,
+        XdsConfigTrackerOptRef(), XdsResourcesDelegateOptRef(), "");
+  } else {
+    state_a = std::make_unique<Envoy::Config::DeltaSubscriptionState>(
+        TypeUrl, callbacks_a, dispatcher_a, XdsConfigTrackerOptRef(), makeOptRef(*symbol_table));
+    state_b = std::make_unique<Envoy::Config::DeltaSubscriptionState>(
+        "type.googleapis.com/envoy.config.endpoint.v3.ClusterLoadAssignment", callbacks_b,
+        dispatcher_b, XdsConfigTrackerOptRef(), makeOptRef(*symbol_table));
+  }
+
+  auto update_interest = [](auto& st, bool unified, const absl::flat_hash_set<std::string>& added,
+                            const absl::flat_hash_set<std::string>& removed) {
+    if (unified) {
+      absl::get<1>(st)->updateSubscriptionInterest(added, removed);
+    } else {
+      absl::get<0>(st)->updateSubscriptionInterest(added, removed);
+    }
+  };
+  auto get_next_req = [](auto& st, bool unified) {
+    if (unified) {
+      return absl::get<1>(st)->getNextRequestAckless();
+    }
+    return std::make_unique<envoy::service::discovery::v3::DeltaDiscoveryRequest>(
+        absl::get<0>(st)->getNextRequestAckless());
+  };
+  auto handle_resp = [](auto& st, bool unified,
+                        envoy::service::discovery::v3::DeltaDiscoveryResponse& msg) {
+    if (unified) {
+      return absl::get<1>(st)->handleResponse(msg);
+    }
+    return absl::get<0>(st)->handleResponse(msg);
+  };
+  auto mark_fresh = [](auto& st, bool unified, bool send_initial) {
+    if (unified) {
+      absl::get<1>(st)->markStreamFresh(send_initial);
+    } else {
+      absl::get<0>(st)->markStreamFresh(send_initial);
+    }
+  };
+
+  const std::string res_a =
+      "xdstp://shared_authority/envoy.config.cluster.v3.Cluster/shared_ns/svc_1";
+  const std::string res_b =
+      "xdstp://shared_authority/envoy.config.endpoint.v3.ClusterLoadAssignment/shared_ns/svc_1";
+  const std::string res_wild =
+      "xdstp://shared_authority/envoy.config.cluster.v3.Cluster/shared_ns/wild_1";
+
+  update_interest(state_a, should_use_unified_, {res_a}, {});
+  const size_t symbols_after_a = symbol_table->numSymbols();
+  update_interest(state_b, should_use_unified_, {res_b}, {});
+
+  if (compress_resource_names_) {
+    EXPECT_GT(symbol_table->numActiveSymbols(), initial_active);
+    // `res_b` shares `shared_authority`, `envoy`, `config`, `v3`, `shared_ns`, `svc`, and `1`
+    // with `res_a`; only `endpoint` and `ClusterLoadAssignment` are new symbols!
+    EXPECT_EQ(symbol_table->numSymbols() - symbols_after_a, 2);
+  } else {
+    EXPECT_EQ(symbol_table->numActiveSymbols(), initial_active);
+    EXPECT_EQ(symbol_table->numSymbols(), initial_total);
+  }
+
+  auto req_a = get_next_req(state_a, should_use_unified_);
+  EXPECT_THAT(req_a->resource_names_subscribe(), UnorderedElementsAre(res_a));
+
+  // Non-wildcard mode: unsolicited resource, unsolicited heartbeat (both unseen tokens and known
+  // tokens), and unsolicited removal must NOT pollute `symbol_table`.
+  const size_t symbols_before_unsolicited = symbol_table->numSymbols();
+  const size_t active_before_unsolicited = symbol_table->numActiveSymbols();
+  {
+    envoy::service::discovery::v3::DeltaDiscoveryResponse msg;
+    msg.set_type_url(TypeUrl);
+    msg.set_nonce("n1");
+    auto* r_good = msg.add_resources();
+    r_good->set_name(res_a);
+    r_good->set_version("v1");
+    r_good->mutable_resource()->set_type_url(TypeUrl);
+    auto* r_unsolicited = msg.add_resources();
+    r_unsolicited->set_name("xdstp://unsolicited_auth/unsolicited_pkg/unsolicited_res");
+    r_unsolicited->set_version("v_unsolicited");
+    r_unsolicited->mutable_resource()->set_type_url(TypeUrl);
+    // Unresolved alias messages (no `resource` field, non-empty `aliases`) pass through
+    // `isHeartbeatResponse` for both unseen tokens and known-token names without mutating
+    // `symbol_table`.
+    auto* r_unseen_alias = msg.add_resources();
+    r_unseen_alias->set_name("xdstp://unseen_alias_auth/unseen_alias_res");
+    r_unseen_alias->set_version("v_alias");
+    r_unseen_alias->add_aliases("alias_unseen");
+    auto* r_known_tokens_alias = msg.add_resources();
+    r_known_tokens_alias->set_name(
+        "xdstp://shared_authority/envoy.config.cluster.v3.Cluster/shared_ns/1");
+    r_known_tokens_alias->set_version("v_alias_known");
+    r_known_tokens_alias->add_aliases("alias_known");
+    msg.add_removed_resources("xdstp://unsolicited_removed_auth/unsolicited_removed_res");
+    msg.add_removed_resources(res_b);
+    handle_resp(state_a, should_use_unified_, msg);
+  }
+  EXPECT_EQ(symbol_table->numSymbols(), symbols_before_unsolicited);
+  EXPECT_EQ(symbol_table->numActiveSymbols(), active_before_unsolicited);
+
+  // Switch `state_a` into explicit wildcard mode, transition `res_a` (`requested -> ambiguous ->
+  // wildcard`), test ambiguous & wildcard heartbeats and TTL expiry, and verify reconnect
+  // `initial_resource_versions`.
+  update_interest(state_a, should_use_unified_, {WildcardStr}, {res_a});
+  std::ignore = get_next_req(state_a, should_use_unified_);
+  {
+    // Heartbeat while `res_a` is in `ambiguous` state is recognized as a heartbeat.
+    envoy::service::discovery::v3::DeltaDiscoveryResponse amb_hb_msg;
+    amb_hb_msg.set_type_url(TypeUrl);
+    amb_hb_msg.set_nonce("n_amb_hb");
+    auto* amb_hb = amb_hb_msg.add_resources();
+    amb_hb->set_name(res_a);
+    amb_hb->set_version("v1");
+    handle_resp(state_a, should_use_unified_, amb_hb_msg);
+  }
+  {
+    // Server sends `res_a` (resolving `ambiguous -> wildcard`) and `res_wild` with a 1s TTL.
+    envoy::service::discovery::v3::DeltaDiscoveryResponse msg;
+    msg.set_type_url(TypeUrl);
+    msg.set_nonce("n2");
+    auto* r_resolved = msg.add_resources();
+    r_resolved->set_name(res_a);
+    r_resolved->set_version("v2");
+    r_resolved->mutable_resource()->set_type_url(TypeUrl);
+    auto* r_wild = msg.add_resources();
+    r_wild->set_name(res_wild);
+    r_wild->set_version("vw1");
+    r_wild->mutable_resource()->set_type_url(TypeUrl);
+    r_wild->mutable_ttl()->set_seconds(1);
+    handle_resp(state_a, should_use_unified_, msg);
+  }
+  {
+    // Heartbeat for wildcard resource `res_wild` refreshes TTL without propagating update.
+    envoy::service::discovery::v3::DeltaDiscoveryResponse hb_msg;
+    hb_msg.set_type_url(TypeUrl);
+    hb_msg.set_nonce("n3");
+    auto* hb = hb_msg.add_resources();
+    hb->set_name(res_wild);
+    hb->set_version("vw1");
+    hb->mutable_ttl()->set_seconds(1);
+    EXPECT_CALL(callbacks_a, onConfigUpdate(_, _, _))
+        .WillOnce(Invoke(
+            [](const auto& added, const auto&, const auto&) { EXPECT_TRUE(added.empty()); }));
+    handle_resp(state_a, should_use_unified_, hb_msg);
+  }
+
+  mark_fresh(state_a, should_use_unified_, true);
+  req_a = get_next_req(state_a, should_use_unified_);
+  EXPECT_THAT(req_a->initial_resource_versions(),
+              UnorderedElementsAre(Pair(res_a, "v2"), Pair(res_wild, "vw1")));
+
+  // Expire TTL on `res_wild` (`wildcard -> dropped`).
+  time_system.setSystemTime(std::chrono::seconds(2));
+  EXPECT_CALL(callbacks_a, onConfigUpdate(_, _, _))
+      .WillOnce(Invoke([&res_wild](const auto& added, const auto& removed, const auto&) {
+        EXPECT_TRUE(added.empty());
+        EXPECT_THAT(removed, UnorderedElementsAre(res_wild));
+      }));
+  ttl_timer_a->invokeCallback();
+
+  // Unsubscribe from wildcard on `state_a` and `res_b` on `state_b`; all active symbols must be
+  // reclaimed!
+  update_interest(state_a, should_use_unified_, {}, {WildcardStr, "xdstp://unseen_unsub/res"});
+  update_interest(state_b, should_use_unified_, {}, {res_b});
+  EXPECT_EQ(symbol_table->numActiveSymbols(), initial_active);
 }
 
 } // namespace

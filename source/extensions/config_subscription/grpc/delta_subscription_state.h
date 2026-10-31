@@ -1,5 +1,9 @@
 #pragma once
 
+#include <set>
+#include <string>
+
+#include "envoy/common/optref.h"
 #include "envoy/config/subscription.h"
 #include "envoy/config/xds_config_tracker.h"
 #include "envoy/event/dispatcher.h"
@@ -10,9 +14,11 @@
 #include "source/common/common/logger.h"
 #include "source/common/config/api_version.h"
 #include "source/common/config/ttl.h"
+#include "source/common/config/xds_symbol_table.h"
 #include "source/extensions/config_subscription/grpc/pausable_ack_queue.h"
 #include "source/extensions/config_subscription/grpc/watch_map.h"
 
+#include "absl/container/flat_hash_map.h"
 #include "absl/container/node_hash_map.h"
 
 namespace Envoy {
@@ -77,7 +83,8 @@ namespace Config {
 class DeltaSubscriptionState : public Logger::Loggable<Logger::Id::config> {
 public:
   DeltaSubscriptionState(std::string type_url, UntypedConfigUpdateCallbacks& watch_map,
-                         Event::Dispatcher& dispatcher, XdsConfigTrackerOptRef xds_config_tracker);
+                         Event::Dispatcher& dispatcher, XdsConfigTrackerOptRef xds_config_tracker,
+                         OptRef<XdsSymbolTable> xds_symbol_table = {});
 
   // Update which resources we're interested in subscribing to.
   void updateSubscriptionInterest(const absl::flat_hash_set<std::string>& cur_added,
@@ -146,20 +153,39 @@ private:
   void addResourceStateFromServer(const envoy::service::discovery::v3::Resource& resource);
   OptRef<ResourceState> getRequestedResourceState(absl::string_view resource_name);
   OptRef<const ResourceState> getRequestedResourceState(absl::string_view resource_name) const;
+  OptRef<const std::string> getWildcardResourceVersion(absl::string_view resource_name) const;
+  OptRef<const std::string> getAmbiguousResourceVersion(absl::string_view resource_name) const;
+  bool containsRequestedResource(absl::string_view resource_name) const {
+    return getRequestedResourceState(resource_name).has_value();
+  }
+  bool requestedResourceStateEmpty() const {
+    return compress_resource_names_ ? compressed_requested_resource_state_.empty()
+                                    : requested_resource_state_.empty();
+  }
+  bool eraseWildcardOrAmbiguousResource(absl::string_view resource_name);
 
   bool isInitialRequestForLegacyWildcard();
+
+  const bool compress_resource_names_;
+  XdsSymbolTableSharedPtr xds_symbol_table_;
 
   // A map from resource name to per-resource version. The keys of this map are exactly the resource
   // names we are currently interested in. Those in the waitingForServer state currently don't have
   // any version for that resource: we need to inform the server if we lose interest in them, but we
   // also need to *not* include them in the initial_resource_versions map upon a reconnect.
   absl::node_hash_map<std::string, ResourceState> requested_resource_state_;
+  absl::flat_hash_map<XdsResourceNameStorage, ResourceState, XdsResourceNameHash, XdsResourceNameEq>
+      compressed_requested_resource_state_;
   // A map from resource name to per-resource version. The keys of this map are resource names we
   // have received as a part of the wildcard subscription.
   absl::node_hash_map<std::string, std::string> wildcard_resource_state_;
+  absl::flat_hash_map<XdsResourceNameStorage, std::string, XdsResourceNameHash, XdsResourceNameEq>
+      compressed_wildcard_resource_state_;
   // Used for storing resources that we lost interest in, but could
   // also be a part of wildcard subscription.
   absl::node_hash_map<std::string, std::string> ambiguous_resource_state_;
+  absl::flat_hash_map<XdsResourceNameStorage, std::string, XdsResourceNameHash, XdsResourceNameEq>
+      compressed_ambiguous_resource_state_;
 
   // Not all xDS resources supports heartbeats due to there being specific information encoded in
   // an empty response, which is indistinguishable from a heartbeat in some cases. For now we just

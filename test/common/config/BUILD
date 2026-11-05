@@ -356,6 +356,46 @@ envoy_benchmark_test(
     benchmark_binary = "xds_resource_decoder_benchmark",
 )
 
+envoy_cc_benchmark_binary(
+    name = "xds_resource_name_benchmark",
+    srcs = ["xds_resource_name_benchmark.cc"],
+    rbe_pool = "linux_x64_small",
+    deps = [
+        "//source/common/config:xds_symbol_table_lib",
+        "//source/common/memory:stats_lib",
+        "//test/common/memory:memory_test_utility_lib",
+        "//test/test_common:utility_lib",
+        "@abseil-cpp//absl/container:btree",
+        "@abseil-cpp//absl/container:flat_hash_map",
+        "@abseil-cpp//absl/container:flat_hash_set",
+        "@abseil-cpp//absl/strings",
+        "@abseil-cpp//absl/strings:str_format",
+        "@benchmark",
+    ],
+)
+
+envoy_benchmark_test(
+    name = "xds_resource_name_benchmark_test",
+    benchmark_binary = "xds_resource_name_benchmark",
+)
+
+envoy_cc_test(
+    name = "xds_memory_test",
+    srcs = ["xds_memory_test.cc"],
+    rbe_pool = "linux_x64_small",
+    deps = [
+        "//source/common/config:xds_symbol_table_lib",
+        "//source/common/memory:stats_lib",
+        "//test/common/memory:memory_test_utility_lib",
+        "//test/test_common:utility_lib",
+        "@abseil-cpp//absl/container:btree",
+        "@abseil-cpp//absl/container:flat_hash_map",
+        "@abseil-cpp//absl/container:flat_hash_set",
+        "@abseil-cpp//absl/strings",
+        "@abseil-cpp//absl/strings:str_format",
+    ],
+)
+
 envoy_cc_test(
     name = "xds_symbol_table_test",
     srcs = ["xds_symbol_table_test.cc"],

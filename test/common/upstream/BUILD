@@ -922,6 +922,48 @@ envoy_benchmark_test(
     benchmark_binary = "metadata_comparison_benchmark",
 )
 
+envoy_cc_benchmark_binary(
+    name = "cluster_manager_compression_benchmark",
+    srcs = ["cluster_manager_compression_benchmark.cc"],
+    rbe_pool = "linux_x64_small",
+    deps = [
+        ":test_cluster_manager",
+        "//envoy/common:optref_lib",
+        "//envoy/config:subscription_interface",
+        "//envoy/config:typed_metadata_interface",
+        "//envoy/config:xds_manager_interface",
+        "//envoy/event:dispatcher_interface",
+        "//envoy/http:codec_interface",
+        "//envoy/stats:stats_interface",
+        "//envoy/thread_local:thread_local_interface",
+        "//envoy/thread_local:thread_local_object",
+        "//envoy/upstream:cluster_manager_interface",
+        "//envoy/upstream:load_balancer_interface",
+        "//envoy/upstream:upstream_interface",
+        "//source/common/common:assert_lib",
+        "//source/common/common:empty_string",
+        "//source/common/config:null_grpc_mux_lib",
+        "//source/common/config:xds_symbol_table_lib",
+        "//source/common/memory:stats_lib",
+        "//source/common/runtime:runtime_features_lib",
+        "//source/common/upstream:upstream_lib",
+        "//test/mocks/upstream:cluster_info_mocks",
+        "@abseil-cpp//absl/status",
+        "@abseil-cpp//absl/status:statusor",
+        "@abseil-cpp//absl/strings",
+        "@abseil-cpp//absl/strings:str_format",
+        "@benchmark",
+        "@envoy_api//envoy/config/bootstrap/v3:pkg_cc_proto",
+        "@envoy_api//envoy/config/cluster/v3:pkg_cc_proto",
+        "@envoy_api//envoy/config/core/v3:pkg_cc_proto",
+    ],
+)
+
+envoy_benchmark_test(
+    name = "cluster_manager_compression_benchmark_test",
+    benchmark_binary = "cluster_manager_compression_benchmark",
+)
+
 envoy_cc_test(
     name = "default_local_address_selector_test",
     size = "small",

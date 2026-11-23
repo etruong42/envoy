@@ -1162,12 +1162,12 @@ private:
 
   struct ResourceManagers {
     ResourceManagers(const envoy::config::cluster::v3::Cluster& config, Runtime::Loader& runtime,
-                     const std::string& cluster_name, Stats::Scope& stats_scope,
+                     absl::string_view cluster_name, Stats::Scope& stats_scope,
                      const ClusterCircuitBreakersStatNames& circuit_breakers_stat_names,
                      Event::Dispatcher& dispatcher);
     absl::StatusOr<ResourceManagerImplPtr>
     load(const envoy::config::cluster::v3::Cluster& config, Runtime::Loader& runtime,
-         const std::string& cluster_name, Stats::Scope& stats_scope,
+         absl::string_view cluster_name, Stats::Scope& stats_scope,
          const envoy::config::core::v3::RoutingPriority& priority);
 
     using Managers = std::array<ResourceManagerImplPtr, NumResourcePriorities>;
@@ -1217,7 +1217,6 @@ private:
   const std::unique_ptr<OptionalClusterStats> optional_cluster_stats_;
   const uint64_t features_;
   mutable ResourceManagers resource_managers_;
-  const std::string maintenance_mode_runtime_key_;
   const UpstreamLocalAddressSelectorConstSharedPtr upstream_local_address_selector_;
   const std::unique_ptr<const envoy::config::core::v3::TypedExtensionConfig> upstream_config_;
   const std::unique_ptr<const envoy::config::core::v3::Metadata> metadata_;

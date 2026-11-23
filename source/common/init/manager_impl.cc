@@ -8,11 +8,16 @@
 namespace Envoy {
 namespace Init {
 
-ManagerImpl::ManagerImpl(absl::string_view name)
-    : name_(fmt::format("init manager {}", name)),
-      watcher_(name_, [this](absl::string_view target_name) { onTargetReady(target_name); }) {}
+ManagerImpl::ManagerImpl(absl::string_view name) : name_(fmt::format("init manager {}", name)) {}
 
 Manager::State ManagerImpl::state() const { return state_; }
+
+WatcherImpl& ManagerImpl::ensureWatcher() {
+  if (!watcher_.has_value()) {
+    watcher_.emplace(name_, [this](absl::string_view target_name) { onTargetReady(target_name); });
+  }
+  return *watcher_;
+}
 
 void ManagerImpl::add(const Target& target) {
   ++count_;
@@ -28,8 +33,8 @@ void ManagerImpl::add(const Target& target) {
     // If the manager is already initializing, initialize the new target immediately. Note that
     // it's important in this case that count_ was incremented above before calling the target,
     // because if the target calls the init manager back immediately, count_ will be decremented
-    // here (see the definition of watcher_ above).
-    target_handle->initialize(watcher_);
+    // here (see ensureWatcher() above).
+    target_handle->initialize(ensureWatcher());
     return;
   case State::Initialized:
     // If the manager has already completed initialization, consider this a programming error.
@@ -53,10 +58,15 @@ void ManagerImpl::initialize(const Watcher& watcher) {
     ENVOY_LOG(debug, "{} initializing", name_);
     state_ = State::Initializing;
 
+    // Move target_handles_ to a local list so handles are released once invoked and iteration
+    // remains safe even if the final target completes synchronously and destroys this manager.
+    auto target_handles = std::move(target_handles_);
+    WatcherImpl& target_watcher = ensureWatcher();
+
     // Attempt to initialize each target. If a target is unavailable, treat it as though it
     // completed immediately.
-    for (const auto& target_handle : target_handles_) {
-      if (!target_handle->initialize(watcher_)) {
+    for (const auto& target_handle : target_handles) {
+      if (!target_handle->initialize(target_watcher)) {
         onTargetReady(target_handle->name());
       }
     }
@@ -95,9 +105,19 @@ void ManagerImpl::onTargetReady(absl::string_view target_name) {
   }
 }
 
+void ManagerImpl::clearAfterInitialization() {
+  ASSERT(state_ == State::Initialized);
+  name_ = std::string();
+}
+
 void ManagerImpl::ready() {
   state_ = State::Initialized;
-  watcher_handle_->ready();
+  target_names_count_ = {};
+  watcher_.reset();
+  // Move watcher_handle_ to a local before invoking ready() in case the callback destroys `this`,
+  // and to immediately reclaim the WatcherHandleImpl and its manager-name string copy.
+  auto local_watcher_handle = std::move(watcher_handle_);
+  local_watcher_handle->ready();
 }
 
 } // namespace Init

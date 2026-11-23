@@ -249,6 +249,35 @@ TEST(InitManagerImplTest, UpdateWatcherWhenInitializing) {
   expectInitialized(m);
 }
 
+TEST(InitManagerImplTest, ClearAfterInitialization) {
+  InSequence s;
+
+  const std::string long_name(256, 'm');
+  ManagerImpl m(long_name);
+  expectUninitialized(m);
+
+  ExpectableTargetImpl t1("t1");
+  m.add(t1);
+
+  ExpectableWatcherImpl w;
+  t1.expectInitialize();
+  m.initialize(w);
+  expectInitializing(m);
+
+  w.expectReady();
+  t1.ready();
+  expectInitialized(m);
+
+  m.clearAfterInitialization();
+  expectInitialized(m);
+
+  envoy::admin::v3::UnreadyTargetsDumps dumps;
+  m.dumpUnreadyTargets(dumps);
+  ASSERT_EQ(1, dumps.unready_targets_dumps_size());
+  EXPECT_TRUE(dumps.unready_targets_dumps(0).name().empty());
+  EXPECT_TRUE(dumps.unready_targets_dumps(0).target_names().empty());
+}
+
 } // namespace
 } // namespace Init
 } // namespace Envoy

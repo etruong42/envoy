@@ -69,6 +69,7 @@
 #include "source/common/upstream/locality_pool.h"
 #include "source/server/transport_socket_config_impl.h"
 
+#include "absl/container/inlined_vector.h"
 #include "absl/container/node_hash_set.h"
 #include "absl/strings/str_cat.h"
 
@@ -1399,7 +1400,6 @@ ClusterInfoImpl::ClusterInfoImpl(
           config, runtime, name_, *stats_scope_,
           factory_context.serverFactoryContext().clusterManager().clusterCircuitBreakersStatNames(),
           factory_context.serverFactoryContext().mainThreadDispatcher()),
-      maintenance_mode_runtime_key_(absl::StrCat("upstream.maintenance_mode.", name_)),
       upstream_local_address_selector_(
           THROW_OR_RETURN_VALUE(createUpstreamLocalAddressSelector(config, bind_config),
                                 Envoy::Upstream::UpstreamLocalAddressSelectorConstSharedPtr)),
@@ -1986,7 +1986,16 @@ HostSetImpl::snapshotUpdateHostsParams(HostSetSnapshotConstSharedPtr snapshot) {
 bool HostSetImpl::excludedByHealthFlags(const Host& host) { return excludeBasedOnHealthFlag(host); }
 
 bool ClusterInfoImpl::maintenanceMode() const {
-  return runtime_.snapshot().featureEnabled(maintenance_mode_runtime_key_, 0);
+  static constexpr absl::string_view kMaintenanceModePrefix = "upstream.maintenance_mode.";
+  const absl::string_view cluster_name = name();
+  absl::InlinedVector<char, 256> key_buf;
+  const size_t total_size = kMaintenanceModePrefix.size() + cluster_name.size();
+  if (total_size > key_buf.capacity()) {
+    key_buf.reserve(total_size);
+  }
+  key_buf.insert(key_buf.end(), kMaintenanceModePrefix.begin(), kMaintenanceModePrefix.end());
+  key_buf.insert(key_buf.end(), cluster_name.begin(), cluster_name.end());
+  return runtime_.snapshot().featureEnabled(absl::string_view(key_buf.data(), key_buf.size()), 0);
 }
 
 bool ClusterInfoImpl::shouldPreconnect(const Host& host) const {
@@ -2025,6 +2034,7 @@ void ClusterImplBase::onPreInitComplete() {
 }
 
 void ClusterImplBase::onInitDone() {
+  init_manager_.clearAfterInitialization();
   info()->configUpdateStats().warming_state_.set(0);
   if (health_checker_ && pending_initialize_health_checks_ == 0) {
     health_checker_->start();
@@ -2257,7 +2267,7 @@ ClusterInfoImpl::OptionalClusterStats::OptionalClusterStats(
 
 ClusterInfoImpl::ResourceManagers::ResourceManagers(
     const envoy::config::cluster::v3::Cluster& config, Runtime::Loader& runtime,
-    const std::string& cluster_name, Stats::Scope& stats_scope,
+    absl::string_view cluster_name, Stats::Scope& stats_scope,
     const ClusterCircuitBreakersStatNames& circuit_breakers_stat_names,
     Event::Dispatcher& dispatcher)
     : circuit_breakers_stat_names_(circuit_breakers_stat_names), dispatcher_(dispatcher) {
@@ -2373,7 +2383,7 @@ ClusterInfoImpl::createSingletonUpstreamNetworkFilterConfigProviderManager(
 
 absl::StatusOr<ResourceManagerImplPtr>
 ClusterInfoImpl::ResourceManagers::load(const envoy::config::cluster::v3::Cluster& config,
-                                        Runtime::Loader& runtime, const std::string& cluster_name,
+                                        Runtime::Loader& runtime, absl::string_view cluster_name,
                                         Stats::Scope& stats_scope,
                                         const envoy::config::core::v3::RoutingPriority& priority) {
   uint64_t max_connections = 1024;
@@ -2386,21 +2396,15 @@ ClusterInfoImpl::ResourceManagers::load(const envoy::config::cluster::v3::Cluste
   bool track_remaining = false;
 
   Stats::StatName priority_stat_name;
-  std::string priority_name;
   switch (priority) {
     PANIC_ON_PROTO_ENUM_SENTINEL_VALUES;
   case envoy::config::core::v3::DEFAULT:
     priority_stat_name = circuit_breakers_stat_names_.default_;
-    priority_name = "default";
     break;
   case envoy::config::core::v3::HIGH:
     priority_stat_name = circuit_breakers_stat_names_.high_;
-    priority_name = "high";
     break;
   }
-
-  const std::string runtime_prefix =
-      fmt::format("circuit_breakers.{}.{}.", cluster_name, priority_name);
 
   const auto& thresholds = config.circuit_breakers().thresholds();
   const auto it = std::find_if(
@@ -2441,8 +2445,8 @@ ClusterInfoImpl::ResourceManagers::load(const envoy::config::cluster::v3::Cluste
     }
   }
   return std::make_unique<ResourceManagerImpl>(
-      runtime, runtime_prefix, max_connections, max_pending_requests, max_requests, max_retries,
-      max_connection_pools, max_connections_per_host,
+      runtime, cluster_name, priority, max_connections, max_pending_requests, max_requests,
+      max_retries, max_connection_pools, max_connections_per_host,
       ClusterInfoImpl::generateCircuitBreakersStats(stats_scope, priority_stat_name,
                                                     track_remaining, circuit_breakers_stat_names_),
       budget_percent, budget_interval, min_retry_concurrency, dispatcher_);

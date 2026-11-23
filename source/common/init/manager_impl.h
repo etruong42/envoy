@@ -1,6 +1,8 @@
 #pragma once
 
 #include <list>
+#include <optional>
+#include <string>
 
 #include "envoy/init/manager.h"
 
@@ -39,7 +41,16 @@ public:
   void updateWatcher(const Watcher& watcher) override;
   void dumpUnreadyTargets(envoy::admin::v3::UnreadyTargetsDumps& dumps) override;
 
+  /**
+   * Releases the manager's human-readable name string after initialization has completed, for
+   * owners (such as ClusterImplBase) that keep the ManagerImpl alive across their lifetime without
+   * dumping unready targets post-initialization.
+   */
+  void clearAfterInitialization();
+
 private:
+  WatcherImpl& ensureWatcher();
+
   // Callback function with an additional target_name parameter, decrease unready targets count by
   // 1, update target_names_count_ hash map.
   void onTargetReady(absl::string_view target_name);
@@ -47,7 +58,7 @@ private:
   void ready();
 
   // Human-readable name for logging.
-  const std::string name_;
+  std::string name_;
 
   // Current state.
   State state_{State::Uninitialized};
@@ -58,11 +69,9 @@ private:
   // Handle to the watcher passed in `initialize`, to be called when initialization completes.
   WatcherHandlePtr watcher_handle_;
 
-  // Watcher to receive ready notifications from each target. We restrict the watcher_ inside
-  // ManagerImpl to be constructed with the 'TargetAwareReadyFn' fn so that the init manager will
-  // get target name information when the watcher_ calls 'onTargetSendName(target_name)' For any
-  // other purpose, a watcher can be constructed with either TargetAwareReadyFn or ReadyFn.
-  const WatcherImpl watcher_;
+  // Lazily-created watcher to receive ready notifications from each target. Managers with zero
+  // targets never allocate this watcher, and `ready()` resets it once all targets complete.
+  std::optional<WatcherImpl> watcher_;
 
   // All registered targets.
   std::list<TargetHandlePtr> target_handles_;

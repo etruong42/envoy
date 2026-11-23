@@ -8,6 +8,7 @@
 #include <memory>
 #include <string>
 
+#include "envoy/config/core/v3/base.pb.h"
 #include "envoy/common/resource.h"
 #include "envoy/event/dispatcher.h"
 #include "envoy/event/timer.h"
@@ -17,6 +18,9 @@
 
 #include "source/common/common/assert.h"
 #include "source/common/common/basic_resource_impl.h"
+
+#include "absl/container/inlined_vector.h"
+#include "absl/strings/string_view.h"
 
 namespace Envoy {
 namespace Upstream {
@@ -84,23 +88,55 @@ struct ManagedResourceImpl : public BasicResourceLimitImpl {
  */
 class ResourceManagerImpl : public ResourceManager {
 public:
-  ResourceManagerImpl(Runtime::Loader& runtime, const std::string& runtime_key,
+  // Cluster circuit-breaker constructor: borrows `cluster_name` (which must outlive this
+  // `ResourceManagerImpl`, as `ClusterInfoImpl::name_` does) and formats runtime keys onto a stack
+  // buffer on demand, avoiding 8 heap `std::string` allocations per priority manager.
+  ResourceManagerImpl(Runtime::Loader& runtime, absl::string_view cluster_name,
+                      envoy::config::core::v3::RoutingPriority priority, uint64_t max_connections,
+                      uint64_t max_pending_requests, uint64_t max_requests, uint64_t max_retries,
+                      uint64_t max_connection_pools, uint64_t max_connections_per_host,
+                      ClusterCircuitBreakersStats cb_stats, std::optional<double> budget_percent,
+                      std::optional<uint64_t> budget_interval,
+                      std::optional<uint32_t> min_retry_concurrency, Event::Dispatcher& dispatcher)
+      : runtime_(runtime), key_prefix_(cluster_name),
+        priority_infix_(priorityInfix(priority)),
+        connections_(max_connections, *this, "max_connections", cb_stats.cx_open_,
+                     cb_stats.remaining_cx_),
+        pending_requests_(max_pending_requests, *this, "max_pending_requests",
+                          cb_stats.rq_pending_open_, cb_stats.remaining_pending_),
+        requests_(max_requests, *this, "max_requests", cb_stats.rq_open_, cb_stats.remaining_rq_),
+        connection_pools_(max_connection_pools, *this, "max_connection_pools",
+                          cb_stats.cx_pool_open_, cb_stats.remaining_cx_pools_),
+        max_connections_per_host_(max_connections_per_host),
+        retries_(budget_percent, budget_interval, min_retry_concurrency, max_retries, *this,
+                 cb_stats.rq_retry_open_, cb_stats.remaining_retries_, requests_, pending_requests_,
+                 dispatcher) {
+    // Count active requests when retry budget is configured.
+    // Pending requests are not counted to avoid counting them twice.
+    if (budget_percent.has_value() || min_retry_concurrency.has_value()) {
+      requests_.on_inc_cb_ = [this]() { retries_.writeRequest(); };
+    }
+  }
+
+  ResourceManagerImpl(Runtime::Loader& runtime, absl::string_view runtime_key,
                       uint64_t max_connections, uint64_t max_pending_requests,
                       uint64_t max_requests, uint64_t max_retries, uint64_t max_connection_pools,
                       uint64_t max_connections_per_host, ClusterCircuitBreakersStats cb_stats,
                       std::optional<double> budget_percent, std::optional<uint64_t> budget_interval,
                       std::optional<uint32_t> min_retry_concurrency, Event::Dispatcher& dispatcher)
-      : connections_(max_connections, runtime, runtime_key + "max_connections", cb_stats.cx_open_,
+      : runtime_(runtime), owned_key_prefix_(copyKeyPrefix(runtime_key)),
+        key_prefix_(owned_key_prefix_ != nullptr
+                        ? absl::string_view(owned_key_prefix_.get(), runtime_key.size())
+                        : absl::string_view()),
+        connections_(max_connections, *this, "max_connections", cb_stats.cx_open_,
                      cb_stats.remaining_cx_),
-        pending_requests_(max_pending_requests, runtime, runtime_key + "max_pending_requests",
+        pending_requests_(max_pending_requests, *this, "max_pending_requests",
                           cb_stats.rq_pending_open_, cb_stats.remaining_pending_),
-        requests_(max_requests, runtime, runtime_key + "max_requests", cb_stats.rq_open_,
-                  cb_stats.remaining_rq_),
-        connection_pools_(max_connection_pools, runtime, runtime_key + "max_connection_pools",
+        requests_(max_requests, *this, "max_requests", cb_stats.rq_open_, cb_stats.remaining_rq_),
+        connection_pools_(max_connection_pools, *this, "max_connection_pools",
                           cb_stats.cx_pool_open_, cb_stats.remaining_cx_pools_),
         max_connections_per_host_(max_connections_per_host),
-        retries_(budget_percent, budget_interval, min_retry_concurrency, max_retries, runtime,
-                 runtime_key + "retry_budget.", runtime_key + "max_retries",
+        retries_(budget_percent, budget_interval, min_retry_concurrency, max_retries, *this,
                  cb_stats.rq_retry_open_, cb_stats.remaining_retries_, requests_, pending_requests_,
                  dispatcher) {
     // Count active requests when retry budget is configured.
@@ -119,22 +155,115 @@ public:
   uint64_t maxConnectionsPerHost() override { return max_connections_per_host_; }
 
 private:
+  using RuntimeKeyBuffer = absl::InlinedVector<char, 256>;
+
+  static absl::string_view priorityInfix(envoy::config::core::v3::RoutingPriority priority) {
+    switch (priority) {
+      PANIC_ON_PROTO_ENUM_SENTINEL_VALUES;
+    case envoy::config::core::v3::DEFAULT:
+      return ".default.";
+    case envoy::config::core::v3::HIGH:
+      return ".high.";
+    }
+    PANIC_DUE_TO_CORRUPT_ENUM;
+  }
+
+  static std::unique_ptr<char[]> copyKeyPrefix(absl::string_view runtime_key) {
+    if (runtime_key.empty()) {
+      return nullptr;
+    }
+    auto copy = std::make_unique<char[]>(runtime_key.size());
+    std::copy_n(runtime_key.data(), runtime_key.size(), copy.get());
+    return copy;
+  }
+
+  absl::string_view buildRuntimeKey(absl::string_view suffix, RuntimeKeyBuffer& buf) const {
+    static constexpr absl::string_view kCircuitBreakersPrefix = "circuit_breakers.";
+    const size_t total_size =
+        (priority_infix_.empty() ? 0 : kCircuitBreakersPrefix.size()) + key_prefix_.size() +
+        priority_infix_.size() + suffix.size();
+    if (total_size > buf.capacity()) {
+      buf.reserve(total_size);
+    }
+    if (!priority_infix_.empty()) {
+      buf.insert(buf.end(), kCircuitBreakersPrefix.begin(), kCircuitBreakersPrefix.end());
+    }
+    buf.insert(buf.end(), key_prefix_.begin(), key_prefix_.end());
+    buf.insert(buf.end(), priority_infix_.begin(), priority_infix_.end());
+    buf.insert(buf.end(), suffix.begin(), suffix.end());
+    return absl::string_view(buf.data(), buf.size());
+  }
+
+  uint64_t getRuntimeInteger(absl::string_view suffix, uint64_t default_value) const {
+    RuntimeKeyBuffer buf;
+    return runtime_.snapshot().getInteger(buildRuntimeKey(suffix, buf), default_value);
+  }
+
+  double getRuntimeDouble(absl::string_view suffix, double default_value) const {
+    RuntimeKeyBuffer buf;
+    return runtime_.snapshot().getDouble(buildRuntimeKey(suffix, buf), default_value);
+  }
+
+  bool hasRuntimeKey(absl::string_view suffix) const {
+    RuntimeKeyBuffer buf;
+    return runtime_.snapshot().get(buildRuntimeKey(suffix, buf)).has_value();
+  }
+
+  struct ClusterResourceImpl final : public ResourceLimit {
+    ClusterResourceImpl(uint64_t max, const ResourceManagerImpl& parent,
+                        absl::string_view runtime_key_suffix, Stats::Gauge& open_gauge,
+                        Stats::Gauge& remaining)
+        : max_(max), parent_(parent), runtime_key_suffix_(runtime_key_suffix),
+          open_gauge_(open_gauge), remaining_(remaining) {
+      remaining_.set(max);
+    }
+
+    // Envoy::ResourceLimit
+    bool canCreate() override { return current_.load() < max(); }
+    void inc() override {
+      ++current_;
+      updateRemaining();
+      open_gauge_.set(canCreate() ? 0 : 1);
+      if (on_inc_cb_) {
+        on_inc_cb_();
+      }
+    }
+    void dec() override { decBy(1); }
+    void decBy(uint64_t amount) override {
+      ASSERT(current_ >= amount);
+      current_ -= amount;
+      updateRemaining();
+      open_gauge_.set(canCreate() ? 0 : 1);
+    }
+    uint64_t max() override { return parent_.getRuntimeInteger(runtime_key_suffix_, max_); }
+    uint64_t count() const override { return current_.load(); }
+
+    void updateRemaining() {
+      const uint64_t current_copy = current_;
+      remaining_.set(max() > current_copy ? max() - current_copy : 0);
+    }
+
+    std::atomic<uint64_t> current_{0};
+    const uint64_t max_;
+    const ResourceManagerImpl& parent_;
+    const absl::string_view runtime_key_suffix_;
+    Stats::Gauge& open_gauge_;
+    Stats::Gauge& remaining_;
+    std::function<void()> on_inc_cb_;
+  };
+
   class RetryBudgetImpl : public ResourceLimit {
   public:
     RetryBudgetImpl(std::optional<double> budget_percent, std::optional<uint64_t> budget_interval,
                     std::optional<uint32_t> min_retry_concurrency, uint64_t max_retries,
-                    Runtime::Loader& runtime, const std::string& retry_budget_runtime_key,
-                    const std::string& max_retries_runtime_key, Stats::Gauge& open_gauge,
+                    const ResourceManagerImpl& parent, Stats::Gauge& open_gauge,
                     Stats::Gauge& remaining, const ResourceLimit& requests,
                     const ResourceLimit& pending_requests, Event::Dispatcher& dispatcher)
-        : runtime_(runtime),
-          max_retry_resource_(max_retries, runtime, max_retries_runtime_key, open_gauge, remaining),
+        : parent_(parent),
+          max_retry_resource_(max_retries, parent, "max_retries", open_gauge, remaining),
           budget_percent_(budget_percent), budget_interval_(budget_interval),
-          min_retry_concurrency_(min_retry_concurrency),
-          budget_percent_key_(retry_budget_runtime_key + "budget_percent"),
-          budget_interval_key_(retry_budget_runtime_key + "budget_interval"),
-          min_retry_concurrency_key_(retry_budget_runtime_key + "min_retry_concurrency"),
-          requests_(requests), pending_requests_(pending_requests), remaining_(remaining) {
+          min_retry_concurrency_(min_retry_concurrency), requests_(requests),
+          pending_requests_(pending_requests), remaining_(remaining) {
       if (budget_interval.has_value() && budget_interval.value() > 0) {
         interval_state_ = std::make_unique<IntervalState>();
         interval_state_->expiration_interval = budget_interval.value() / NumSlots;
@@ -185,10 +314,11 @@ private:
         return max_retry_resource_.max();
       }
 
-      const double budget_percent = runtime_.snapshot().getDouble(
-          budget_percent_key_, budget_percent_ ? *budget_percent_ : 20.0);
-      const uint32_t min_retry_concurrency = runtime_.snapshot().getInteger(
-          min_retry_concurrency_key_, min_retry_concurrency_ ? *min_retry_concurrency_ : 3);
+      const double budget_percent = parent_.getRuntimeDouble(
+          "retry_budget.budget_percent", budget_percent_ ? *budget_percent_ : 20.0);
+      const uint32_t min_retry_concurrency = parent_.getRuntimeInteger(
+          "retry_budget.min_retry_concurrency",
+          min_retry_concurrency_ ? *min_retry_concurrency_ : 3);
 
       clearRemainingGauge();
 
@@ -196,8 +326,8 @@ private:
       uint64_t requests_for_budget = requests_.count() + pending_requests_.count();
 
       if (interval_state_ != nullptr) {
-        const uint64_t configured_interval = runtime_.snapshot().getInteger(
-            budget_interval_key_, budget_interval_ ? *budget_interval_ : 0);
+        const uint64_t configured_interval = parent_.getRuntimeInteger(
+            "retry_budget.budget_interval", budget_interval_ ? *budget_interval_ : 0);
         if (configured_interval > 0) {
           // Retry budget implementation across a fixed window inspired by tower.rs:
           // https://github.com/tower-rs/tower/blob/master/tower/src/retry/budget/tps_budget.rs
@@ -214,8 +344,8 @@ private:
 
   private:
     bool useRetryBudget() const {
-      return runtime_.snapshot().get(budget_percent_key_).has_value() ||
-             runtime_.snapshot().get(min_retry_concurrency_key_).has_value() || budget_percent_ ||
+      return parent_.hasRuntimeKey("retry_budget.budget_percent") ||
+             parent_.hasRuntimeKey("retry_budget.min_retry_concurrency") || budget_percent_ ||
              min_retry_concurrency_;
     }
 
@@ -245,16 +375,13 @@ private:
       }
     }
 
-    Runtime::Loader& runtime_;
+    const ResourceManagerImpl& parent_;
     // The max_retry resource is nested within the budget to maintain state if the retry budget is
     // toggled.
-    ManagedResourceImpl max_retry_resource_;
+    ClusterResourceImpl max_retry_resource_;
     const std::optional<double> budget_percent_;
     const std::optional<uint64_t> budget_interval_;
     const std::optional<uint32_t> min_retry_concurrency_;
-    const std::string budget_percent_key_;
-    const std::string budget_interval_key_;
-    const std::string min_retry_concurrency_key_;
     const ResourceLimit& requests_;
     const ResourceLimit& pending_requests_;
     Stats::Gauge& remaining_;
@@ -272,10 +399,14 @@ private:
     std::unique_ptr<IntervalState> interval_state_;
   };
 
-  ManagedResourceImpl connections_;
-  ManagedResourceImpl pending_requests_;
-  ManagedResourceImpl requests_;
-  ManagedResourceImpl connection_pools_;
+  Runtime::Loader& runtime_;
+  const std::unique_ptr<char[]> owned_key_prefix_;
+  const absl::string_view key_prefix_;
+  const absl::string_view priority_infix_;
+  ClusterResourceImpl connections_;
+  ClusterResourceImpl pending_requests_;
+  ClusterResourceImpl requests_;
+  ClusterResourceImpl connection_pools_;
   uint64_t max_connections_per_host_;
   RetryBudgetImpl retries_;
 };

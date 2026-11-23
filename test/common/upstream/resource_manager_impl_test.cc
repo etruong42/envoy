@@ -293,6 +293,55 @@ TEST(ResourceManagerImplTest, RetryBudgetIntervalEnabled) {
   }
   EXPECT_FALSE(rm.retries().canCreate());
 }
+
+TEST(ResourceManagerImplTest, ClusterPriorityRuntimeKeys) {
+  NiceMock<Runtime::MockLoader> runtime;
+  NiceMock<Stats::MockGauge> gauge;
+  NiceMock<Stats::MockStore> store;
+  NiceMock<Event::MockDispatcher> dispatcher;
+
+  ON_CALL(store, gauge(_, _)).WillByDefault(ReturnRef(gauge));
+
+  // Exercise both the inline stack buffer path and >256-byte runtime key spill path.
+  for (const std::string& cluster_name :
+       {std::string("short_cluster"),
+        std::string("xdstp://traffic-director-global.xds.googleapis.com/"
+                    "envoy.config.cluster.v3.Cluster/") +
+            std::string(260, 'x')}) {
+    ResourceManagerImpl default_rm(runtime, cluster_name, envoy::config::core::v3::DEFAULT, 0, 0, 0,
+                                   1, 0, 100, clusterCircuitBreakersStats(store), std::nullopt,
+                                   std::nullopt, std::nullopt, dispatcher);
+    ResourceManagerImpl high_rm(runtime, cluster_name, envoy::config::core::v3::HIGH, 0, 0, 0, 1, 0,
+                                100, clusterCircuitBreakersStats(store), 25.0,
+                                static_cast<uint64_t>(100), static_cast<uint32_t>(4), dispatcher);
+
+    EXPECT_CALL(runtime.snapshot_,
+                getInteger("circuit_breakers." + cluster_name + ".default.max_connections", 0U))
+        .WillOnce(Return(7U));
+    EXPECT_EQ(7U, default_rm.connections().max());
+
+    EXPECT_CALL(runtime.snapshot_,
+                getInteger("circuit_breakers." + cluster_name + ".default.max_retries", 1U))
+        .WillOnce(Return(9U));
+    EXPECT_EQ(9U, default_rm.retries().max());
+
+    EXPECT_CALL(runtime.snapshot_,
+                getDouble("circuit_breakers." + cluster_name + ".high.retry_budget.budget_percent",
+                          25.0))
+        .WillOnce(Return(50.0));
+    EXPECT_CALL(runtime.snapshot_,
+                getInteger("circuit_breakers." + cluster_name +
+                               ".high.retry_budget.min_retry_concurrency",
+                           4U))
+        .WillOnce(Return(6U));
+    EXPECT_CALL(runtime.snapshot_,
+                getInteger("circuit_breakers." + cluster_name +
+                               ".high.retry_budget.budget_interval",
+                           100U))
+        .WillOnce(Return(0U));
+    EXPECT_EQ(6U, high_rm.retries().max());
+  }
+}
 } // namespace
 } // namespace Upstream
 } // namespace Envoy

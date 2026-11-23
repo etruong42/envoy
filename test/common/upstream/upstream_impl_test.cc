@@ -7905,6 +7905,45 @@ TEST_F(StaticClusterImplTest, RingHashUsesEndpointHostnameForHashing) {
   }
 }
 
+TEST_F(ClusterInfoImplTest, MaintenanceModeAndCircuitBreakersDynamicKeys) {
+  const std::string long_cluster_name =
+      "xdstp://traffic-director-global.xds.googleapis.com/envoy.config.cluster.v3.Cluster/" +
+      std::string(240, 'c');
+  const std::string yaml = fmt::format(R"EOF(
+    name: "{}"
+    connect_timeout: 0.25s
+    type: STATIC
+    lb_policy: ROUND_ROBIN
+    load_assignment:
+      endpoints:
+        - lb_endpoints:
+            - endpoint:
+                address:
+                  socket_address:
+                    address: 127.0.0.1
+                    port_value: 1234
+  )EOF",
+                                       long_cluster_name);
+
+  auto cluster = makeCluster(yaml);
+  ASSERT_NE(cluster, nullptr);
+
+  EXPECT_CALL(runtime_.snapshot_,
+              featureEnabled("upstream.maintenance_mode." + long_cluster_name, 0))
+      .WillOnce(Return(true));
+  EXPECT_TRUE(cluster->info()->maintenanceMode());
+
+  EXPECT_CALL(runtime_.snapshot_,
+              getInteger("circuit_breakers." + long_cluster_name + ".default.max_requests", 1024U))
+      .WillOnce(Return(42U));
+  EXPECT_EQ(42U, cluster->info()->resourceManager(ResourcePriority::Default).requests().max());
+
+  EXPECT_CALL(runtime_.snapshot_,
+              getInteger("circuit_breakers." + long_cluster_name + ".high.max_connections", 1024U))
+      .WillOnce(Return(17U));
+  EXPECT_EQ(17U, cluster->info()->resourceManager(ResourcePriority::High).connections().max());
+}
+
 } // namespace
 } // namespace Upstream
 } // namespace Envoy

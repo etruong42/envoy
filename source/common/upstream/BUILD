@@ -413,6 +413,9 @@ envoy_cc_library(
         "//envoy/upstream:upstream_interface",
         "//source/common/common:assert_lib",
         "//source/common/common:basic_resource_lib",
+        "@abseil-cpp//absl/container:inlined_vector",
+        "@abseil-cpp//absl/strings:string_view",
+        "@envoy_api//envoy/config/core/v3:pkg_cc_proto",
     ],
 )
 
@@ -426,6 +429,7 @@ envoy_cc_library(
         # TODO(mattklein123): Move the clusters to extensions so they can be compiled out.
         ":upstream_includes",
         ":transport_socket_match_lib",
+        "@abseil-cpp//absl/container:inlined_vector",
         "@envoy_api//envoy/config/cluster/v3:pkg_cc_proto",
         "@envoy_api//envoy/config/core/v3:pkg_cc_proto",
         "//source/common/stats:deferred_creation",
